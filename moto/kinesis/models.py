@@ -72,6 +72,9 @@ class Shard(BaseModel):
                 break
 
         millis_behind_latest = int(secs_behind_latest * 1000)
+        if last_sequence_id == self.get_max_sequence_number() and not self.is_active():
+            return results, None, millis_behind_latest
+
         return results, last_sequence_id, millis_behind_latest
 
     def put_record(self, partition_key, data, explicit_hash_key):
