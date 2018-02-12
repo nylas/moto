@@ -67,7 +67,7 @@ class Shard(BaseModel):
             if len(results) == limit:
                 break
 
-        if last_sequence_id == self.get_max_sequence_number():
+        if last_sequence_id == self.get_max_sequence_number() and not self.is_active():
             return results, None
         return results, last_sequence_id
 
