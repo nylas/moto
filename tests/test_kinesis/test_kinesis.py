@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+import unittest
+
 import boto.kinesis
 from boto.kinesis.exceptions import ResourceNotFoundException, InvalidArgumentException
 import boto3
@@ -124,13 +126,14 @@ def test_put_records():
     shard_iterator = response['ShardIterator']
 
     response = conn.get_records(shard_iterator)
-    shard_iterator = response['NextShardIterator']
     response['Records'].should.have.length_of(1)
     record = response['Records'][0]
 
     record["Data"].should.equal("hello world")
     record["PartitionKey"].should.equal("1234")
     record["SequenceNumber"].should.equal("1")
+    record["ApproximateArrivalTimestamp"].shouldnot.equal(None)
+
 
 
 @mock_kinesis_deprecated
@@ -468,7 +471,7 @@ def test_split_shard():
     conn = boto.kinesis.connect_to_region("us-west-2")
     stream_name = 'my_stream'
 
-    conn.create_stream(stream_name, 2)
+    conn.create_stream(stream_name, 1)
 
     # Create some data
     for index in range(1, 100):
@@ -478,9 +481,7 @@ def test_split_shard():
 
     stream = stream_response["StreamDescription"]
     shards = stream['Shards']
-    shards.should.have.length_of(2)
-    sum([shard['SequenceNumberRange']['EndingSequenceNumber']
-         for shard in shards]).should.equal(99)
+    shards.should.have.length_of(1)
 
     shard_range = shards[0]['HashKeyRange']
     new_starting_hash = (
@@ -492,23 +493,27 @@ def test_split_shard():
     stream = stream_response["StreamDescription"]
     shards = stream['Shards']
     shards.should.have.length_of(3)
-    sum([shard['SequenceNumberRange']['EndingSequenceNumber']
-         for shard in shards]).should.equal(99)
+    # The old shard is closed and has an ending sequence number
+    shards[0]['SequenceNumberRange']['EndingSequenceNumber'].should.equal(99)
 
-    shard_range = shards[2]['HashKeyRange']
-    new_starting_hash = (
-        int(shard_range['EndingHashKey']) + int(shard_range['StartingHashKey'])) // 2
-    conn.split_shard("my_stream", shards[2]['ShardId'], str(new_starting_hash))
+    response = conn.get_shard_iterator(stream_name, shards[0]['ShardId'], 'LATEST')
+    shard_iterator = response['ShardIterator']
+    response = conn.get_records(shard_iterator)
+    shard_iterator = response['NextShardIterator']
+    shard_iterator.should.equal('null')
 
-    stream_response = conn.describe_stream(stream_name)
+    # The new shards are open
+    for shard in shards[1:2]:
+        shard['SequenceNumberRange'].get('EndingSequenceNumber').should.equal(None)
 
-    stream = stream_response["StreamDescription"]
-    shards = stream['Shards']
-    shards.should.have.length_of(4)
-    sum([shard['SequenceNumberRange']['EndingSequenceNumber']
-         for shard in shards]).should.equal(99)
+    for index in range(100, 200):
+        put_resp = conn.put_record(stream_name, str(index), str(index))
+        # Must only be written to the new shards
+        ['shardId-000000000001', 'shardId-000000000002'].should.contain(put_resp['ShardId'])
 
 
+
+@unittest.skip
 @mock_kinesis_deprecated
 def test_merge_shards():
     conn = boto.kinesis.connect_to_region("us-west-2")
