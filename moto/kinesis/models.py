@@ -32,20 +32,28 @@ class Record(BaseModel):
             "Data": self.data,
             "PartitionKey": self.partition_key,
             "SequenceNumber": str(self.sequence_number),
+            "ApproximateArrivalTimestamp": int(self.create_at*1000)
         }
 
 
 class Shard(BaseModel):
 
-    def __init__(self, shard_id, starting_hash, ending_hash):
+    def __init__(self, shard_id, starting_hash, ending_hash, status='ACTIVE'):
         self._shard_id = shard_id
         self.starting_hash = starting_hash
         self.ending_hash = ending_hash
         self.records = OrderedDict()
+        self.status = status
 
     @property
     def shard_id(self):
         return "shardId-{0}".format(str(self._shard_id).zfill(12))
+
+    def close(self):
+        self.status = "CLOSED"
+
+    def is_active(self):
+        return self.status == "ACTIVE"
 
     def get_records(self, last_sequence_id, limit):
         last_sequence_id = int(last_sequence_id)
@@ -59,10 +67,15 @@ class Shard(BaseModel):
             if len(results) == limit:
                 break
 
+        if last_sequence_id == self.get_max_sequence_number():
+            return results, None
         return results, last_sequence_id
 
     def put_record(self, partition_key, data, explicit_hash_key):
         # Note: this function is not safe for concurrency
+        if not self.is_active():
+            raise Exception('Cannot write record to closed shard. This is an error in moto')
+
         if self.records:
             last_sequence_number = self.get_max_sequence_number()
         else:
@@ -92,17 +105,19 @@ class Shard(BaseModel):
             return r.sequence_number
 
     def to_json(self):
-        return {
+        base = {
             "HashKeyRange": {
                 "EndingHashKey": str(self.ending_hash),
                 "StartingHashKey": str(self.starting_hash)
             },
             "SequenceNumberRange": {
-                "EndingSequenceNumber": self.get_max_sequence_number(),
                 "StartingSequenceNumber": self.get_min_sequence_number(),
             },
             "ShardId": self.shard_id
         }
+        if not self.is_active():
+            base["SequenceNumberRange"]["EndingSequenceNumber"] = self.get_max_sequence_number()
+        return base
 
 
 class Stream(BaseModel):
@@ -162,7 +177,7 @@ class Stream(BaseModel):
             key = int(md5(partition_key.encode('utf-8')).hexdigest(), 16)
 
         for shard in self.shards.values():
-            if shard.starting_hash <= key < shard.ending_hash:
+            if shard.is_active() and shard.starting_hash <= key < shard.ending_hash:
                 return shard
 
     def put_record(self, partition_key, explicit_hash_key, sequence_number_for_ordering, data):
@@ -378,29 +393,23 @@ class KinesisBackend(BaseBackend):
             raise InvalidArgumentError(new_starting_hash_key)
         new_starting_hash_key = int(new_starting_hash_key)
 
-        shard = stream.shards[shard_to_split]
+        old_shard = stream.shards[shard_to_split]
 
         last_id = sorted(stream.shards.values(),
                          key=attrgetter('_shard_id'))[-1]._shard_id
 
-        if shard.starting_hash < new_starting_hash_key < shard.ending_hash:
-            new_shard = Shard(
-                last_id + 1, new_starting_hash_key, shard.ending_hash)
-            shard.ending_hash = new_starting_hash_key
-            stream.shards[new_shard.shard_id] = new_shard
+        if old_shard.starting_hash < new_starting_hash_key < old_shard.ending_hash:
+            new_shard_left_shard = Shard(
+                last_id + 1, old_shard.starting_hash, new_starting_hash_key)
+            new_right_shard = Shard(last_id + 2, new_starting_hash_key, old_shard.ending_hash)
+            stream.shards[new_shard_left_shard.shard_id] = new_shard_left_shard
+            stream.shards[new_right_shard.shard_id] = new_right_shard
+            old_shard.close()
         else:
             raise InvalidArgumentError(new_starting_hash_key)
 
-        records = shard.records
-        shard.records = OrderedDict()
-
-        for index in records:
-            record = records[index]
-            stream.put_record(
-                record.partition_key, record.explicit_hash_key, None, record.data
-            )
-
     def merge_shards(self, stream_name, shard_to_merge, adjacent_shard_to_merge):
+        raise Exception('TODO')
         stream = self.describe_stream(stream_name)
 
         if shard_to_merge not in stream.shards:
