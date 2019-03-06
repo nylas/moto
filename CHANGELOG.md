@@ -1,12 +1,75 @@
 Moto Changelog
 ===================
 
+1.3.7
+-----
+
+    * Switch from mocking requests to using before-send for AWS calls
+
+1.3.6
+-----
+
+    * Fix boto3 pinning.
+
+1.3.5
+-----
+
+    * Pin down botocore issue as temporary fix for #1793.
+    * More features on secrets manager
+
+1.3.4
+------
+
+    * IAM get account authorization details
+    * adding account id to ManagedPolicy ARN
+    * APIGateway usage plans and usage plan keys
+    * ECR list images
+
+1.3.3
+------
+    
+    * Fix a regression in S3 url regexes
+    * APIGateway region fixes
+    * ECS improvements
+    * Add @mock_cognitoidentity, thanks to @brcoding
+
+
+1.3.2
+------
+The huge change in this version is that the responses library is no longer vendored. Many developers are now unblocked. Kudos to @spulec for the fix.
+
+    * Fix route53 TTL bug
+    * Added filtering support for S3 lifecycle
+    * unvendoring responses
+
+1.3.0
+------
+
+Dozens of major endpoint additions in this release. Highlights include:
+
+    * Fixed AMI tests and the Travis build setup
+    * SNS improvements
+    * Dynamodb improvements
+    * EBS improvements
+    * Redshift improvements
+    * RDS snapshot improvements
+    * S3 improvements
+    * Cloudwatch improvements
+    * SSM improvements
+    * IAM improvements
+    * ELBV1 and ELBV2 improvements
+    * Lambda improvements
+    * EC2 spot pricing improvements
+    * ApiGateway improvements
+    * VPC improvements
+
 1.2.0
 ------
 
     * Supports filtering AMIs by self
     * Implemented signal_workflow_execution for SWF
     * Wired SWF backend to the moto server
+    * Added url decoding to x-amz-copy-source header for copying S3 files
     * Revamped lambda function storage to do versioning
     * IOT improvements
     * RDS improvements

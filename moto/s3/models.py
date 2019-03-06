@@ -6,23 +6,40 @@ import hashlib
 import copy
 import itertools
 import codecs
+import random
+import string
+import tempfile
+import sys
+
 import six
 
 from bisect import insort
 from moto.core import BaseBackend, BaseModel
 from moto.core.utils import iso_8601_datetime_with_milliseconds, rfc_1123_datetime
-from .exceptions import BucketAlreadyExists, MissingBucket, InvalidPart, EntityTooSmall, MissingKey
+from .exceptions import BucketAlreadyExists, MissingBucket, InvalidBucketName, InvalidPart, \
+    EntityTooSmall, MissingKey, InvalidNotificationDestination, MalformedXML, InvalidStorageClass, DuplicateTagKeys
 from .utils import clean_key_name, _VersionedKeyStore
 
+MAX_BUCKET_NAME_LENGTH = 63
+MIN_BUCKET_NAME_LENGTH = 3
 UPLOAD_ID_BYTES = 43
 UPLOAD_PART_MIN_SIZE = 5242880
+STORAGE_CLASS = ["STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA"]
+DEFAULT_KEY_BUFFER_SIZE = 16 * 1024 * 1024
+DEFAULT_TEXT_ENCODING = sys.getdefaultencoding()
 
 
 class FakeDeleteMarker(BaseModel):
 
     def __init__(self, key):
         self.key = key
+        self.name = key.name
+        self.last_modified = datetime.datetime.utcnow()
         self._version_id = key.version_id + 1
+
+    @property
+    def last_modified_ISO8601(self):
+        return iso_8601_datetime_with_milliseconds(self.last_modified)
 
     @property
     def version_id(self):
@@ -31,9 +48,9 @@ class FakeDeleteMarker(BaseModel):
 
 class FakeKey(BaseModel):
 
-    def __init__(self, name, value, storage="STANDARD", etag=None, is_versioned=False, version_id=0):
+    def __init__(self, name, value, storage="STANDARD", etag=None, is_versioned=False, version_id=0,
+                 max_buffer_size=DEFAULT_KEY_BUFFER_SIZE):
         self.name = name
-        self.value = value
         self.last_modified = datetime.datetime.utcnow()
         self.acl = get_canned_acl('private')
         self.website_redirect_location = None
@@ -45,9 +62,29 @@ class FakeKey(BaseModel):
         self._is_versioned = is_versioned
         self._tagging = FakeTagging()
 
+        self._value_buffer = tempfile.SpooledTemporaryFile(max_size=max_buffer_size)
+        self._max_buffer_size = max_buffer_size
+        self.value = value
+
     @property
     def version_id(self):
         return self._version_id
+
+    @property
+    def value(self):
+        self._value_buffer.seek(0)
+        return self._value_buffer.read()
+
+    @value.setter
+    def value(self, new_value):
+        self._value_buffer.seek(0)
+        self._value_buffer.truncate()
+
+        # Hack for working around moto's own unit tests; this probably won't
+        # actually get hit in normal use.
+        if isinstance(new_value, six.text_type):
+            new_value = new_value.encode(DEFAULT_TEXT_ENCODING)
+        self._value_buffer.write(new_value)
 
     def copy(self, new_name=None):
         r = copy.deepcopy(self)
@@ -63,14 +100,18 @@ class FakeKey(BaseModel):
     def set_tagging(self, tagging):
         self._tagging = tagging
 
-    def set_storage_class(self, storage_class):
-        self._storage_class = storage_class
+    def set_storage_class(self, storage):
+        if storage is not None and storage not in STORAGE_CLASS:
+            raise InvalidStorageClass(storage=storage)
+        self._storage_class = storage
 
     def set_acl(self, acl):
         self.acl = acl
 
     def append_to_value(self, value):
-        self.value += value
+        self._value_buffer.seek(0, os.SEEK_END)
+        self._value_buffer.write(value)
+
         self.last_modified = datetime.datetime.utcnow()
         self._etag = None  # must recalculate etag
         if self._is_versioned:
@@ -88,11 +129,13 @@ class FakeKey(BaseModel):
     def etag(self):
         if self._etag is None:
             value_md5 = hashlib.md5()
-            if isinstance(self.value, six.text_type):
-                value = self.value.encode("utf-8")
-            else:
-                value = self.value
-            value_md5.update(value)
+            self._value_buffer.seek(0)
+            while True:
+                block = self._value_buffer.read(DEFAULT_KEY_BUFFER_SIZE)
+                if not block:
+                    break
+                value_md5.update(block)
+
             self._etag = value_md5.hexdigest()
         return '"{0}"'.format(self._etag)
 
@@ -119,7 +162,7 @@ class FakeKey(BaseModel):
         res = {
             'ETag': self.etag,
             'last-modified': self.last_modified_RFC1123,
-            'content-length': str(len(self.value)),
+            'content-length': str(self.size),
         }
         if self._storage_class != 'STANDARD':
             res['x-amz-storage-class'] = self._storage_class
@@ -137,7 +180,8 @@ class FakeKey(BaseModel):
 
     @property
     def size(self):
-        return len(self.value)
+        self._value_buffer.seek(0, os.SEEK_END)
+        return self._value_buffer.tell()
 
     @property
     def storage_class(self):
@@ -147,6 +191,26 @@ class FakeKey(BaseModel):
     def expiry_date(self):
         if self._expiry is not None:
             return self._expiry.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    # Keys need to be pickleable due to some implementation details of boto3.
+    # Since file objects aren't pickleable, we need to override the default
+    # behavior. The following is adapted from the Python docs:
+    # https://docs.python.org/3/library/pickle.html#handling-stateful-objects
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['value'] = self.value
+        del state['_value_buffer']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update({
+            k: v for k, v in six.iteritems(state)
+            if k != 'value'
+        })
+
+        self._value_buffer = \
+            tempfile.SpooledTemporaryFile(max_size=self._max_buffer_size)
+        self.value = state['value']
 
 
 class FakeMultipart(BaseModel):
@@ -168,11 +232,14 @@ class FakeMultipart(BaseModel):
         count = 0
         for pn, etag in body:
             part = self.parts.get(pn)
-            if part is None or part.etag != etag:
+            part_etag = None
+            if part is not None:
+                part_etag = part.etag.replace('"', '')
+                etag = etag.replace('"', '')
+            if part is None or part_etag != etag:
                 raise InvalidPart()
             if last is not None and len(last.value) < UPLOAD_PART_MIN_SIZE:
                 raise EntityTooSmall()
-            part_etag = part.etag.replace('"', '')
             md5s.extend(decode_hex(part_etag)[0])
             total.extend(part.value)
             last = part
@@ -270,7 +337,7 @@ def get_canned_acl(acl):
         grants.append(FakeGrant([ALL_USERS_GRANTEE], [PERMISSION_READ]))
     elif acl == 'public-read-write':
         grants.append(FakeGrant([ALL_USERS_GRANTEE], [
-                      PERMISSION_READ, PERMISSION_WRITE]))
+            PERMISSION_READ, PERMISSION_WRITE]))
     elif acl == 'authenticated-read':
         grants.append(
             FakeGrant([AUTHENTICATED_USERS_GRANTEE], [PERMISSION_READ]))
@@ -282,7 +349,7 @@ def get_canned_acl(acl):
         pass  # TODO: bucket owner, EC2 Read
     elif acl == 'log-delivery-write':
         grants.append(FakeGrant([LOG_DELIVERY_GRANTEE], [
-                      PERMISSION_READ_ACP, PERMISSION_WRITE]))
+            PERMISSION_READ_ACP, PERMISSION_WRITE]))
     else:
         assert False, 'Unknown canned acl: %s' % (acl,)
     return FakeAcl(grants=grants)
@@ -307,19 +374,41 @@ class FakeTag(BaseModel):
         self.value = value
 
 
+class LifecycleFilter(BaseModel):
+
+    def __init__(self, prefix=None, tag=None, and_filter=None):
+        self.prefix = prefix or ''
+        self.tag = tag
+        self.and_filter = and_filter
+
+
+class LifecycleAndFilter(BaseModel):
+
+    def __init__(self, prefix=None, tags=None):
+        self.prefix = prefix or ''
+        self.tags = tags
+
+
 class LifecycleRule(BaseModel):
 
-    def __init__(self, id=None, prefix=None, status=None, expiration_days=None,
-                 expiration_date=None, transition_days=None,
-                 transition_date=None, storage_class=None):
+    def __init__(self, id=None, prefix=None, lc_filter=None, status=None, expiration_days=None,
+                 expiration_date=None, transition_days=None, transition_date=None, storage_class=None,
+                 expired_object_delete_marker=None, nve_noncurrent_days=None, nvt_noncurrent_days=None,
+                 nvt_storage_class=None, aimu_days=None):
         self.id = id
         self.prefix = prefix
+        self.filter = lc_filter
         self.status = status
         self.expiration_days = expiration_days
         self.expiration_date = expiration_date
         self.transition_days = transition_days
         self.transition_date = transition_date
         self.storage_class = storage_class
+        self.expired_object_delete_marker = expired_object_delete_marker
+        self.nve_noncurrent_days = nve_noncurrent_days
+        self.nvt_noncurrent_days = nvt_noncurrent_days
+        self.nvt_storage_class = nvt_storage_class
+        self.aimu_days = aimu_days
 
 
 class CorsRule(BaseModel):
@@ -331,6 +420,26 @@ class CorsRule(BaseModel):
         self.allowed_headers = [allowed_headers] if isinstance(allowed_headers, six.string_types) else allowed_headers
         self.exposed_headers = [expose_headers] if isinstance(expose_headers, six.string_types) else expose_headers
         self.max_age_seconds = max_age_seconds
+
+
+class Notification(BaseModel):
+
+    def __init__(self, arn, events, filters=None, id=None):
+        self.id = id if id else ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(50))
+        self.arn = arn
+        self.events = events
+        self.filters = filters if filters else {}
+
+
+class NotificationConfiguration(BaseModel):
+
+    def __init__(self, topic=None, queue=None, cloud_function=None):
+        self.topic = [Notification(t["Topic"], t["Event"], filters=t.get("Filter"), id=t.get("Id")) for t in topic] \
+            if topic else []
+        self.queue = [Notification(q["Queue"], q["Event"], filters=q.get("Filter"), id=q.get("Id")) for q in queue] \
+            if queue else []
+        self.cloud_function = [Notification(c["CloudFunction"], c["Event"], filters=c.get("Filter"), id=c.get("Id"))
+                               for c in cloud_function] if cloud_function else []
 
 
 class FakeBucket(BaseModel):
@@ -348,6 +457,7 @@ class FakeBucket(BaseModel):
         self.tags = FakeTagging()
         self.cors = []
         self.logging = {}
+        self.notification_configuration = None
 
     @property
     def location(self):
@@ -360,18 +470,82 @@ class FakeBucket(BaseModel):
     def set_lifecycle(self, rules):
         self.rules = []
         for rule in rules:
+            # Extract and validate actions from Lifecycle rule
             expiration = rule.get('Expiration')
             transition = rule.get('Transition')
+
+            nve_noncurrent_days = None
+            if rule.get('NoncurrentVersionExpiration') is not None:
+                if rule["NoncurrentVersionExpiration"].get('NoncurrentDays') is None:
+                    raise MalformedXML()
+                nve_noncurrent_days = rule["NoncurrentVersionExpiration"]["NoncurrentDays"]
+
+            nvt_noncurrent_days = None
+            nvt_storage_class = None
+            if rule.get('NoncurrentVersionTransition') is not None:
+                if rule["NoncurrentVersionTransition"].get('NoncurrentDays') is None:
+                    raise MalformedXML()
+                if rule["NoncurrentVersionTransition"].get('StorageClass') is None:
+                    raise MalformedXML()
+                nvt_noncurrent_days = rule["NoncurrentVersionTransition"]["NoncurrentDays"]
+                nvt_storage_class = rule["NoncurrentVersionTransition"]["StorageClass"]
+
+            aimu_days = None
+            if rule.get('AbortIncompleteMultipartUpload') is not None:
+                if rule["AbortIncompleteMultipartUpload"].get('DaysAfterInitiation') is None:
+                    raise MalformedXML()
+                aimu_days = rule["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"]
+
+            eodm = None
+            if expiration and expiration.get("ExpiredObjectDeleteMarker") is not None:
+                # This cannot be set if Date or Days is set:
+                if expiration.get("Days") or expiration.get("Date"):
+                    raise MalformedXML()
+                eodm = expiration["ExpiredObjectDeleteMarker"]
+
+            # Pull out the filter:
+            lc_filter = None
+            if rule.get("Filter"):
+                # Can't have both `Filter` and `Prefix` (need to check for the presence of the key):
+                try:
+                    if rule["Prefix"] or not rule["Prefix"]:
+                        raise MalformedXML()
+                except KeyError:
+                    pass
+
+                and_filter = None
+                if rule["Filter"].get("And"):
+                    and_tags = []
+                    if rule["Filter"]["And"].get("Tag"):
+                        if not isinstance(rule["Filter"]["And"]["Tag"], list):
+                            rule["Filter"]["And"]["Tag"] = [rule["Filter"]["And"]["Tag"]]
+
+                        for t in rule["Filter"]["And"]["Tag"]:
+                            and_tags.append(FakeTag(t["Key"], t.get("Value", '')))
+
+                    and_filter = LifecycleAndFilter(prefix=rule["Filter"]["And"]["Prefix"], tags=and_tags)
+
+                filter_tag = None
+                if rule["Filter"].get("Tag"):
+                    filter_tag = FakeTag(rule["Filter"]["Tag"]["Key"], rule["Filter"]["Tag"].get("Value", ''))
+
+                lc_filter = LifecycleFilter(prefix=rule["Filter"]["Prefix"], tag=filter_tag, and_filter=and_filter)
+
             self.rules.append(LifecycleRule(
                 id=rule.get('ID'),
                 prefix=rule.get('Prefix'),
+                lc_filter=lc_filter,
                 status=rule['Status'],
                 expiration_days=expiration.get('Days') if expiration else None,
                 expiration_date=expiration.get('Date') if expiration else None,
                 transition_days=transition.get('Days') if transition else None,
                 transition_date=transition.get('Date') if transition else None,
-                storage_class=transition[
-                    'StorageClass'] if transition else None,
+                storage_class=transition.get('StorageClass') if transition else None,
+                expired_object_delete_marker=eodm,
+                nve_noncurrent_days=nve_noncurrent_days,
+                nvt_noncurrent_days=nvt_noncurrent_days,
+                nvt_storage_class=nvt_storage_class,
+                aimu_days=aimu_days,
             ))
 
     def delete_lifecycle(self):
@@ -426,36 +600,55 @@ class FakeBucket(BaseModel):
     def set_logging(self, logging_config, bucket_backend):
         if not logging_config:
             self.logging = {}
-        else:
-            from moto.s3.exceptions import InvalidTargetBucketForLogging, CrossLocationLoggingProhibitted
-            # Target bucket must exist in the same account (assuming all moto buckets are in the same account):
-            if not bucket_backend.buckets.get(logging_config["TargetBucket"]):
-                raise InvalidTargetBucketForLogging("The target bucket for logging does not exist.")
+            return
 
-            # Does the target bucket have the log-delivery WRITE and READ_ACP permissions?
-            write = read_acp = False
-            for grant in bucket_backend.buckets[logging_config["TargetBucket"]].acl.grants:
-                # Must be granted to: http://acs.amazonaws.com/groups/s3/LogDelivery
-                for grantee in grant.grantees:
-                    if grantee.uri == "http://acs.amazonaws.com/groups/s3/LogDelivery":
-                        if "WRITE" in grant.permissions or "FULL_CONTROL" in grant.permissions:
-                            write = True
+        from moto.s3.exceptions import InvalidTargetBucketForLogging, CrossLocationLoggingProhibitted
+        # Target bucket must exist in the same account (assuming all moto buckets are in the same account):
+        if not bucket_backend.buckets.get(logging_config["TargetBucket"]):
+            raise InvalidTargetBucketForLogging("The target bucket for logging does not exist.")
 
-                        if "READ_ACP" in grant.permissions or "FULL_CONTROL" in grant.permissions:
-                            read_acp = True
+        # Does the target bucket have the log-delivery WRITE and READ_ACP permissions?
+        write = read_acp = False
+        for grant in bucket_backend.buckets[logging_config["TargetBucket"]].acl.grants:
+            # Must be granted to: http://acs.amazonaws.com/groups/s3/LogDelivery
+            for grantee in grant.grantees:
+                if grantee.uri == "http://acs.amazonaws.com/groups/s3/LogDelivery":
+                    if "WRITE" in grant.permissions or "FULL_CONTROL" in grant.permissions:
+                        write = True
 
-                        break
+                    if "READ_ACP" in grant.permissions or "FULL_CONTROL" in grant.permissions:
+                        read_acp = True
 
-            if not write or not read_acp:
-                raise InvalidTargetBucketForLogging("You must give the log-delivery group WRITE and READ_ACP"
-                                                    " permissions to the target bucket")
+                    break
 
-            # Buckets must also exist within the same region:
-            if bucket_backend.buckets[logging_config["TargetBucket"]].region_name != self.region_name:
-                raise CrossLocationLoggingProhibitted()
+        if not write or not read_acp:
+            raise InvalidTargetBucketForLogging("You must give the log-delivery group WRITE and READ_ACP"
+                                                " permissions to the target bucket")
 
-            # Checks pass -- set the logging config:
-            self.logging = logging_config
+        # Buckets must also exist within the same region:
+        if bucket_backend.buckets[logging_config["TargetBucket"]].region_name != self.region_name:
+            raise CrossLocationLoggingProhibitted()
+
+        # Checks pass -- set the logging config:
+        self.logging = logging_config
+
+    def set_notification_configuration(self, notification_config):
+        if not notification_config:
+            self.notification_configuration = None
+            return
+
+        self.notification_configuration = NotificationConfiguration(
+            topic=notification_config.get("TopicConfiguration"),
+            queue=notification_config.get("QueueConfiguration"),
+            cloud_function=notification_config.get("CloudFunctionConfiguration")
+        )
+
+        # Validate that the region is correct:
+        for thing in ["topic", "queue", "cloud_function"]:
+            for t in getattr(self.notification_configuration, thing):
+                region = t.arn.split(":")[3]
+                if region != self.region_name:
+                    raise InvalidNotificationDestination()
 
     def set_website_configuration(self, website_configuration):
         self.website_configuration = website_configuration
@@ -492,6 +685,8 @@ class S3Backend(BaseBackend):
     def create_bucket(self, bucket_name, region_name):
         if bucket_name in self.buckets:
             raise BucketAlreadyExists(bucket=bucket_name)
+        if not MIN_BUCKET_NAME_LENGTH <= len(bucket_name) <= MAX_BUCKET_NAME_LENGTH:
+            raise InvalidBucketName()
         new_bucket = FakeBucket(name=bucket_name, region_name=region_name)
         self.buckets[bucket_name] = new_bucket
         return new_bucket
@@ -525,10 +720,7 @@ class S3Backend(BaseBackend):
         latest_versions = {}
 
         for version in versions:
-            if isinstance(version, FakeDeleteMarker):
-                name = version.key.name
-            else:
-                name = version.name
+            name = version.name
             version_id = version.version_id
             maximum_version_per_key[name] = max(
                 version_id,
@@ -577,6 +769,8 @@ class S3Backend(BaseBackend):
 
     def set_key(self, bucket_name, key_name, value, storage=None, etag=None):
         key_name = clean_key_name(key_name)
+        if storage is not None and storage not in STORAGE_CLASS:
+            raise InvalidStorageClass(storage=storage)
 
         bucket = self.get_bucket(bucket_name)
 
@@ -614,7 +808,7 @@ class S3Backend(BaseBackend):
                 if key_name in bucket.keys:
                     key = bucket.keys[key_name]
             else:
-                for key_version in bucket.keys.getlist(key_name):
+                for key_version in bucket.keys.getlist(key_name, default=[]):
                     if str(key_version.version_id) == str(version_id):
                         key = key_version
                         break
@@ -632,6 +826,9 @@ class S3Backend(BaseBackend):
         return key
 
     def put_bucket_tagging(self, bucket_name, tagging):
+        tag_keys = [tag.key for tag in tagging.tag_set.tags]
+        if len(tag_keys) != len(set(tag_keys)):
+            raise DuplicateTagKeys()
         bucket = self.get_bucket(bucket_name)
         bucket.set_tags(tagging)
 
@@ -650,6 +847,10 @@ class S3Backend(BaseBackend):
     def delete_bucket_cors(self, bucket_name):
         bucket = self.get_bucket(bucket_name)
         bucket.delete_cors()
+
+    def put_bucket_notification_configuration(self, bucket_name, notification_config):
+        bucket = self.get_bucket(bucket_name)
+        bucket.set_notification_configuration(notification_config)
 
     def initiate_multipart(self, bucket_name, key_name, metadata):
         bucket = self.get_bucket(bucket_name)
@@ -722,6 +923,7 @@ class S3Backend(BaseBackend):
                 else:
                     key_results.add(key)
 
+        key_results = filter(lambda key: not isinstance(key, FakeDeleteMarker), key_results)
         key_results = sorted(key_results, key=lambda key: key.name)
         folder_results = [folder_name for folder_name in sorted(
             folder_results, key=lambda key: key)]
@@ -755,6 +957,9 @@ class S3Backend(BaseBackend):
                             if str(key.version_id) != str(version_id)
                         ]
                     )
+
+                    if not bucket.keys.getlist(key_name):
+                        bucket.keys.pop(key_name)
             return True
         except KeyError:
             return False

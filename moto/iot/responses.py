@@ -1,7 +1,9 @@
 from __future__ import unicode_literals
+
+import json
+
 from moto.core.responses import BaseResponse
 from .models import iot_backends
-import json
 
 
 class IoTResponse(BaseResponse):
@@ -32,30 +34,39 @@ class IoTResponse(BaseResponse):
         return json.dumps(dict(thingTypeName=thing_type_name, thingTypeArn=thing_type_arn))
 
     def list_thing_types(self):
-        # previous_next_token = self._get_param("nextToken")
-        # max_results = self._get_int_param("maxResults")
+        previous_next_token = self._get_param("nextToken")
+        max_results = self._get_int_param("maxResults", 50)  # not the default, but makes testing easier
         thing_type_name = self._get_param("thingTypeName")
         thing_types = self.iot_backend.list_thing_types(
             thing_type_name=thing_type_name
         )
-        # TODO: implement pagination in the future
-        next_token = None
-        return json.dumps(dict(thingTypes=[_.to_dict() for _ in thing_types], nextToken=next_token))
+
+        thing_types = [_.to_dict() for _ in thing_types]
+        if previous_next_token is None:
+            result = thing_types[0:max_results]
+            next_token = str(max_results) if len(thing_types) > max_results else None
+        else:
+            token = int(previous_next_token)
+            result = thing_types[token:token + max_results]
+            next_token = str(token + max_results) if len(thing_types) > token + max_results else None
+
+        return json.dumps(dict(thingTypes=result, nextToken=next_token))
 
     def list_things(self):
-        # previous_next_token = self._get_param("nextToken")
-        # max_results = self._get_int_param("maxResults")
+        previous_next_token = self._get_param("nextToken")
+        max_results = self._get_int_param("maxResults", 50)  # not the default, but makes testing easier
         attribute_name = self._get_param("attributeName")
         attribute_value = self._get_param("attributeValue")
         thing_type_name = self._get_param("thingTypeName")
-        things = self.iot_backend.list_things(
+        things, next_token = self.iot_backend.list_things(
             attribute_name=attribute_name,
             attribute_value=attribute_value,
             thing_type_name=thing_type_name,
+            max_results=max_results,
+            token=previous_next_token
         )
-        # TODO: implement pagination in the future
-        next_token = None
-        return json.dumps(dict(things=[_.to_dict() for _ in things], nextToken=next_token))
+
+        return json.dumps(dict(things=things, nextToken=next_token))
 
     def describe_thing(self):
         thing_name = self._get_param("thingName")
@@ -102,8 +113,44 @@ class IoTResponse(BaseResponse):
         )
         return json.dumps(dict())
 
+    def create_job(self):
+        job_arn, job_id, description = self.iot_backend.create_job(
+            job_id=self._get_param("jobId"),
+            targets=self._get_param("targets"),
+            description=self._get_param("description"),
+            document_source=self._get_param("documentSource"),
+            document=self._get_param("document"),
+            presigned_url_config=self._get_param("presignedUrlConfig"),
+            target_selection=self._get_param("targetSelection"),
+            job_executions_rollout_config=self._get_param("jobExecutionsRolloutConfig"),
+            document_parameters=self._get_param("documentParameters")
+        )
+
+        return json.dumps(dict(jobArn=job_arn, jobId=job_id, description=description))
+
+    def describe_job(self):
+        job = self.iot_backend.describe_job(job_id=self._get_param("jobId"))
+        return json.dumps(dict(
+            documentSource=job.document_source,
+            job=dict(
+                comment=job.comment,
+                completedAt=job.completed_at,
+                createdAt=job.created_at,
+                description=job.description,
+                documentParameters=job.document_parameters,
+                jobArn=job.job_arn,
+                jobExecutionsRolloutConfig=job.job_executions_rollout_config,
+                jobId=job.job_id,
+                jobProcessDetails=job.job_process_details,
+                lastUpdatedAt=job.last_updated_at,
+                presignedUrlConfig=job.presigned_url_config,
+                status=job.status,
+                targets=job.targets,
+                targetSelection=job.target_selection
+            )))
+
     def create_keys_and_certificate(self):
-        set_as_active = self._get_param("setAsActive")
+        set_as_active = self._get_bool_param("setAsActive")
         cert, key_pair = self.iot_backend.create_keys_and_certificate(
             set_as_active=set_as_active,
         )
@@ -177,12 +224,30 @@ class IoTResponse(BaseResponse):
         )
         return json.dumps(dict())
 
+    def attach_policy(self):
+        policy_name = self._get_param("policyName")
+        target = self._get_param('target')
+        self.iot_backend.attach_policy(
+            policy_name=policy_name,
+            target=target,
+        )
+        return json.dumps(dict())
+
     def attach_principal_policy(self):
         policy_name = self._get_param("policyName")
         principal = self.headers.get('x-amzn-iot-principal')
         self.iot_backend.attach_principal_policy(
             policy_name=policy_name,
             principal_arn=principal,
+        )
+        return json.dumps(dict())
+
+    def detach_policy(self):
+        policy_name = self._get_param("policyName")
+        target = self._get_param('target')
+        self.iot_backend.detach_policy(
+            policy_name=policy_name,
+            target=target,
         )
         return json.dumps(dict())
 

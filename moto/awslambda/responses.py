@@ -7,7 +7,7 @@ try:
 except ImportError:
     from urllib.parse import unquote
 
-from moto.core.utils import amz_crc32, amzn_request_id
+from moto.core.utils import amz_crc32, amzn_request_id, path_url
 from moto.core.responses import BaseResponse
 from .models import lambda_backends
 
@@ -52,7 +52,11 @@ class LambdaResponse(BaseResponse):
         self.setup_class(request, full_url, headers)
         if request.method == 'GET':
             # This is ListVersionByFunction
-            raise ValueError("Cannot handle request")
+
+            path = request.path if hasattr(request, 'path') else path_url(request.url)
+            function_name = path.split('/')[-2]
+            return self._list_versions_by_function(function_name)
+
         elif request.method == 'POST':
             return self._publish_function(request, full_url, headers)
         else:
@@ -94,25 +98,21 @@ class LambdaResponse(BaseResponse):
             return self._add_policy(request, full_url, headers)
 
     def _add_policy(self, request, full_url, headers):
-        lambda_backend = self.get_lambda_backend(full_url)
-
-        path = request.path if hasattr(request, 'path') else request.path_url
+        path = request.path if hasattr(request, 'path') else path_url(request.url)
         function_name = path.split('/')[-2]
-        if lambda_backend.has_function(function_name):
+        if self.lambda_backend.get_function(function_name):
             policy = request.body.decode('utf8')
-            lambda_backend.add_policy(function_name, policy)
+            self.lambda_backend.add_policy(function_name, policy)
             return 200, {}, json.dumps(dict(Statement=policy))
         else:
             return 404, {}, "{}"
 
     def _get_policy(self, request, full_url, headers):
-        lambda_backend = self.get_lambda_backend(full_url)
-
-        path = request.path if hasattr(request, 'path') else request.path_url
+        path = request.path if hasattr(request, 'path') else path_url(request.url)
         function_name = path.split('/')[-2]
-        if lambda_backend.has_function(function_name):
-            function = lambda_backend.get_function(function_name)
-            return 200, {}, json.dumps(dict(Policy="{\"Statement\":[" + function.policy + "]}"))
+        if self.lambda_backend.get_function(function_name):
+            lambda_function = self.lambda_backend.get_function(function_name)
+            return 200, {}, json.dumps(dict(Policy="{\"Statement\":[" + lambda_function.policy + "]}"))
         else:
             return 404, {}, "{}"
 
@@ -152,6 +152,19 @@ class LambdaResponse(BaseResponse):
             json_data = fn.get_configuration()
 
             result['Functions'].append(json_data)
+
+        return 200, {}, json.dumps(result)
+
+    def _list_versions_by_function(self, function_name):
+        result = {
+            'Versions': []
+        }
+
+        functions = self.lambda_backend.list_versions_by_function(function_name)
+        if functions:
+            for fn in functions:
+                json_data = fn.get_configuration()
+                result['Versions'].append(json_data)
 
         return 200, {}, json.dumps(result)
 

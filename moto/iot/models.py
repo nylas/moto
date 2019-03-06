@@ -1,13 +1,20 @@
 from __future__ import unicode_literals
-import time
-import boto3
-import string
-import random
+
 import hashlib
+import random
+import re
+import string
+import time
 import uuid
-from moto.core import BaseBackend, BaseModel
 from collections import OrderedDict
+from datetime import datetime
+
+import boto3
+
+from moto.core import BaseBackend, BaseModel
 from .exceptions import (
+    CertificateStateException,
+    DeleteConflictException,
     ResourceNotFoundException,
     InvalidRequestException,
     VersionConflictException
@@ -30,6 +37,7 @@ class FakeThing(BaseModel):
     def to_dict(self, include_default_client_id=False):
         obj = {
             'thingName': self.thing_name,
+            'thingArn': self.arn,
             'attributes': self.attributes,
             'version': self.version
         }
@@ -159,11 +167,76 @@ class FakePolicy(BaseModel):
         }
 
 
+class FakeJob(BaseModel):
+    JOB_ID_REGEX_PATTERN = "[a-zA-Z0-9_-]"
+    JOB_ID_REGEX = re.compile(JOB_ID_REGEX_PATTERN)
+
+    def __init__(self, job_id, targets, document_source, document, description, presigned_url_config, target_selection,
+                 job_executions_rollout_config, document_parameters, region_name):
+        if not self._job_id_matcher(self.JOB_ID_REGEX, job_id):
+            raise InvalidRequestException()
+
+        self.region_name = region_name
+        self.job_id = job_id
+        self.job_arn = 'arn:aws:iot:%s:1:job/%s' % (self.region_name, job_id)
+        self.targets = targets
+        self.document_source = document_source
+        self.document = document
+        self.description = description
+        self.presigned_url_config = presigned_url_config
+        self.target_selection = target_selection
+        self.job_executions_rollout_config = job_executions_rollout_config
+        self.status = None  # IN_PROGRESS | CANCELED | COMPLETED
+        self.comment = None
+        self.created_at = time.mktime(datetime(2015, 1, 1).timetuple())
+        self.last_updated_at = time.mktime(datetime(2015, 1, 1).timetuple())
+        self.completed_at = None
+        self.job_process_details = {
+            'processingTargets': targets,
+            'numberOfQueuedThings': 1,
+            'numberOfCanceledThings': 0,
+            'numberOfSucceededThings': 0,
+            'numberOfFailedThings': 0,
+            'numberOfRejectedThings': 0,
+            'numberOfInProgressThings': 0,
+            'numberOfRemovedThings': 0
+        }
+        self.document_parameters = document_parameters
+
+    def to_dict(self):
+        obj = {
+            'jobArn': self.job_arn,
+            'jobId': self.job_id,
+            'targets': self.targets,
+            'description': self.description,
+            'presignedUrlConfig': self.presigned_url_config,
+            'targetSelection': self.target_selection,
+            'jobExecutionsRolloutConfig': self.job_executions_rollout_config,
+            'status': self.status,
+            'comment': self.comment,
+            'createdAt': self.created_at,
+            'lastUpdatedAt': self.last_updated_at,
+            'completedAt': self.completedAt,
+            'jobProcessDetails': self.job_process_details,
+            'documentParameters': self.document_parameters,
+            'document': self.document,
+            'documentSource': self.document_source
+        }
+
+        return obj
+
+    def _job_id_matcher(self, regex, argument):
+        regex_match = regex.match(argument)
+        length_match = len(argument) <= 64
+        return regex_match and length_match
+
+
 class IoTBackend(BaseBackend):
     def __init__(self, region_name=None):
         super(IoTBackend, self).__init__()
         self.region_name = region_name
         self.things = OrderedDict()
+        self.jobs = OrderedDict()
         self.thing_types = OrderedDict()
         self.thing_groups = OrderedDict()
         self.certificates = OrderedDict()
@@ -203,15 +276,37 @@ class IoTBackend(BaseBackend):
 
     def list_thing_types(self, thing_type_name=None):
         if thing_type_name:
-            # It's wierd but thing_type_name is filterd by forward match, not complete match
+            # It's weird but thing_type_name is filtered by forward match, not complete match
             return [_ for _ in self.thing_types.values() if _.thing_type_name.startswith(thing_type_name)]
-        thing_types = self.thing_types.values()
-        return thing_types
+        return self.thing_types.values()
 
-    def list_things(self, attribute_name, attribute_value, thing_type_name):
-        # TODO: filter by attributess or thing_type
-        things = self.things.values()
-        return things
+    def list_things(self, attribute_name, attribute_value, thing_type_name, max_results, token):
+        all_things = [_.to_dict() for _ in self.things.values()]
+        if attribute_name is not None and thing_type_name is not None:
+            filtered_things = list(filter(lambda elem:
+                                          attribute_name in elem["attributes"] and
+                                          elem["attributes"][attribute_name] == attribute_value and
+                                          "thingTypeName" in elem and
+                                          elem["thingTypeName"] == thing_type_name, all_things))
+        elif attribute_name is not None and thing_type_name is None:
+            filtered_things = list(filter(lambda elem:
+                                          attribute_name in elem["attributes"] and
+                                          elem["attributes"][attribute_name] == attribute_value, all_things))
+        elif attribute_name is None and thing_type_name is not None:
+            filtered_things = list(
+                filter(lambda elem: "thingTypeName" in elem and elem["thingTypeName"] == thing_type_name, all_things))
+        else:
+            filtered_things = all_things
+
+        if token is None:
+            things = filtered_things[0:max_results]
+            next_token = str(max_results) if len(filtered_things) > max_results else None
+        else:
+            token = int(token)
+            things = filtered_things[token:token + max_results]
+            next_token = str(token + max_results) if len(filtered_things) > token + max_results else None
+
+        return things, next_token
 
     def describe_thing(self, thing_name):
         things = [_ for _ in self.things.values() if _.thing_name == thing_name]
@@ -285,7 +380,25 @@ class IoTBackend(BaseBackend):
         return certificate, key_pair
 
     def delete_certificate(self, certificate_id):
-        self.describe_certificate(certificate_id)
+        cert = self.describe_certificate(certificate_id)
+        if cert.status == 'ACTIVE':
+            raise CertificateStateException(
+                'Certificate must be deactivated (not ACTIVE) before deletion.', certificate_id)
+
+        certs = [k[0] for k, v in self.principal_things.items()
+                 if self._get_principal(k[0]).certificate_id == certificate_id]
+        if len(certs) > 0:
+            raise DeleteConflictException(
+                'Things must be detached before deletion (arn: %s)' % certs[0]
+            )
+
+        certs = [k[0] for k, v in self.principal_policies.items()
+                 if self._get_principal(k[0]).certificate_id == certificate_id]
+        if len(certs) > 0:
+            raise DeleteConflictException(
+                'Certificate policies must be detached before deletion (arn: %s)' % certs[0]
+            )
+
         del self.certificates[certificate_id]
 
     def describe_certificate(self, certificate_id):
@@ -318,6 +431,14 @@ class IoTBackend(BaseBackend):
         return policies[0]
 
     def delete_policy(self, policy_name):
+
+        policies = [k[1] for k, v in self.principal_policies.items() if k[1] == policy_name]
+        if len(policies) > 0:
+            raise DeleteConflictException(
+                'The policy cannot be deleted as the policy is attached to one or more principals (name=%s)'
+                % policy_name
+            )
+
         policy = self.get_policy(policy_name)
         del self.policies[policy.name]
 
@@ -336,6 +457,14 @@ class IoTBackend(BaseBackend):
             pass
         raise ResourceNotFoundException()
 
+    def attach_policy(self, policy_name, target):
+        principal = self._get_principal(target)
+        policy = self.get_policy(policy_name)
+        k = (target, policy_name)
+        if k in self.principal_policies:
+            return
+        self.principal_policies[k] = (principal, policy)
+
     def attach_principal_policy(self, policy_name, principal_arn):
         principal = self._get_principal(principal_arn)
         policy = self.get_policy(policy_name)
@@ -343,6 +472,15 @@ class IoTBackend(BaseBackend):
         if k in self.principal_policies:
             return
         self.principal_policies[k] = (principal, policy)
+
+    def detach_policy(self, policy_name, target):
+        # this may raises ResourceNotFoundException
+        self._get_principal(target)
+        self.get_policy(policy_name)
+        k = (target, policy_name)
+        if k not in self.principal_policies:
+            raise ResourceNotFoundException()
+        del self.principal_policies[k]
 
     def detach_principal_policy(self, policy_name, principal_arn):
         # this may raises ResourceNotFoundException
@@ -506,6 +644,16 @@ class IoTBackend(BaseBackend):
                 thing_group.thing_group_name, None,
                 thing.thing_name, None
             )
+
+    def create_job(self, job_id, targets, document_source, document, description, presigned_url_config,
+                   target_selection, job_executions_rollout_config, document_parameters):
+        job = FakeJob(job_id, targets, document_source, document, description, presigned_url_config, target_selection,
+                      job_executions_rollout_config, document_parameters, self.region_name)
+        self.jobs[job_id] = job
+        return job.job_arn, job_id, description
+
+    def describe_job(self, job_id):
+        return self.jobs[job_id]
 
 
 available_regions = boto3.session.Session().get_available_regions("iot")

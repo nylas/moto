@@ -34,6 +34,9 @@ class DomainDispatcherApplication(object):
         self.service = service
 
     def get_backend_for_host(self, host):
+        if host == 'moto_api':
+            return host
+
         if self.service:
             return self.service
 
@@ -69,13 +72,21 @@ class DomainDispatcherApplication(object):
                 _, _, region, service, _ = environ['HTTP_AUTHORIZATION'].split(",")[0].split()[
                     1].split("/")
             except (KeyError, ValueError):
+                # Some cognito-idp endpoints (e.g. change password) do not receive an auth header.
+                if environ.get('HTTP_X_AMZ_TARGET', '').startswith('AWSCognitoIdentityProviderService'):
+                    service = 'cognito-idp'
+                else:
+                    service = 's3'
+
                 region = 'us-east-1'
-                service = 's3'
             if service == 'dynamodb':
-                dynamo_api_version = environ['HTTP_X_AMZ_TARGET'].split("_")[1].split(".")[0]
-                # If Newer API version, use dynamodb2
-                if dynamo_api_version > "20111205":
-                    host = "dynamodb2"
+                if environ['HTTP_X_AMZ_TARGET'].startswith('DynamoDBStreams'):
+                    host = 'dynamodbstreams'
+                else:
+                    dynamo_api_version = environ['HTTP_X_AMZ_TARGET'].split("_")[1].split(".")[0]
+                    # If Newer API version, use dynamodb2
+                    if dynamo_api_version > "20111205":
+                        host = "dynamodb2"
             else:
                 host = "{service}.{region}.amazonaws.com".format(
                     service=service, region=region)
@@ -186,9 +197,17 @@ def main(argv=sys.argv[1:]):
     parser.add_argument(
         '-s', '--ssl',
         action='store_true',
-        help='Enable SSL encrypted connection (use https://... URL)',
+        help='Enable SSL encrypted connection with auto-generated certificate (use https://... URL)',
         default=False
     )
+    parser.add_argument(
+        '-c', '--ssl-cert', type=str,
+        help='Path to SSL certificate',
+        default=None)
+    parser.add_argument(
+        '-k', '--ssl-key', type=str,
+        help='Path to SSL private key',
+        default=None)
 
     args = parser.parse_args(argv)
 
@@ -197,9 +216,15 @@ def main(argv=sys.argv[1:]):
         create_backend_app, service=args.service)
     main_app.debug = True
 
+    ssl_context = None
+    if args.ssl_key and args.ssl_cert:
+        ssl_context = (args.ssl_cert, args.ssl_key)
+    elif args.ssl:
+        ssl_context = 'adhoc'
+
     run_simple(args.host, args.port, main_app,
                threaded=True, use_reloader=args.reload,
-               ssl_context='adhoc' if args.ssl else None)
+               ssl_context=ssl_context)
 
 
 if __name__ == '__main__':

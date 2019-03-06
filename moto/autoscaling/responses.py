@@ -85,6 +85,8 @@ class AutoScalingResponse(BaseResponse):
             termination_policies=self._get_multi_param(
                 'TerminationPolicies.member'),
             tags=self._get_list_prefix('Tags.member'),
+            new_instances_protected_from_scale_in=self._get_bool_param(
+                'NewInstancesProtectedFromScaleIn', False)
         )
         template = self.response_template(CREATE_AUTOSCALING_GROUP_TEMPLATE)
         return template.render()
@@ -166,7 +168,7 @@ class AutoScalingResponse(BaseResponse):
             start = all_names.index(token) + 1
         else:
             start = 0
-        max_records = self._get_param("MaxRecords", 50)
+        max_records = self._get_int_param("MaxRecords", 50)
         if max_records > 100:
             raise ValueError
         groups = all_groups[start:start + max_records]
@@ -192,6 +194,8 @@ class AutoScalingResponse(BaseResponse):
             placement_group=self._get_param('PlacementGroup'),
             termination_policies=self._get_multi_param(
                 'TerminationPolicies.member'),
+            new_instances_protected_from_scale_in=self._get_bool_param(
+                'NewInstancesProtectedFromScaleIn', None)
         )
         template = self.response_template(UPDATE_AUTOSCALING_GROUP_TEMPLATE)
         return template.render()
@@ -283,6 +287,22 @@ class AutoScalingResponse(BaseResponse):
         template = self.response_template(DETACH_LOAD_BALANCERS_TEMPLATE)
         return template.render()
 
+    def suspend_processes(self):
+        autoscaling_group_name = self._get_param('AutoScalingGroupName')
+        scaling_processes = self._get_multi_param('ScalingProcesses.member')
+        self.autoscaling_backend.suspend_processes(autoscaling_group_name, scaling_processes)
+        template = self.response_template(SUSPEND_PROCESSES_TEMPLATE)
+        return template.render()
+
+    def set_instance_protection(self):
+        group_name = self._get_param('AutoScalingGroupName')
+        instance_ids = self._get_multi_param('InstanceIds.member')
+        protected_from_scale_in = self._get_bool_param('ProtectedFromScaleIn')
+        self.autoscaling_backend.set_instance_protection(
+            group_name, instance_ids, protected_from_scale_in)
+        template = self.response_template(SET_INSTANCE_PROTECTION_TEMPLATE)
+        return template.render()
+
 
 CREATE_LAUNCH_CONFIGURATION_TEMPLATE = """<CreateLaunchConfigurationResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
 <ResponseMetadata>
@@ -313,8 +333,7 @@ DESCRIBE_LAUNCH_CONFIGURATIONS_TEMPLATE = """<DescribeLaunchConfigurationsRespon
             <UserData/>
           {% endif %}
           <InstanceType>{{ launch_configuration.instance_type }}</InstanceType>
-          <LaunchConfigurationARN>arn:aws:autoscaling:us-east-1:803981987763:launchConfiguration:
-          9dbbbf87-6141-428a-a409-0752edbe6cad:launchConfigurationName/{{ launch_configuration.name }}</LaunchConfigurationARN>
+          <LaunchConfigurationARN>arn:aws:autoscaling:us-east-1:803981987763:launchConfiguration:9dbbbf87-6141-428a-a409-0752edbe6cad:launchConfigurationName/{{ launch_configuration.name }}</LaunchConfigurationARN>
           {% if launch_configuration.block_device_mappings %}
             <BlockDeviceMappings>
             {% for mount_point, mapping in launch_configuration.block_device_mappings.items() %}
@@ -463,7 +482,14 @@ DESCRIBE_AUTOSCALING_GROUPS_TEMPLATE = """<DescribeAutoScalingGroupsResponse xml
           </member>
           {% endfor %}
         </Tags>
-        <SuspendedProcesses/>
+        <SuspendedProcesses>
+          {% for suspended_process in group.suspended_processes %}
+          <member>
+            <ProcessName>{{suspended_process}}</ProcessName>
+            <SuspensionReason></SuspensionReason>
+          </member>
+          {% endfor %}
+        </SuspendedProcesses>
         <AutoScalingGroupName>{{ group.name }}</AutoScalingGroupName>
         <HealthCheckType>{{ group.health_check_type }}</HealthCheckType>
         <CreatedTime>2013-05-06T17:47:15.107Z</CreatedTime>
@@ -477,6 +503,7 @@ DESCRIBE_AUTOSCALING_GROUPS_TEMPLATE = """<DescribeAutoScalingGroupsResponse xml
             <InstanceId>{{ instance_state.instance.id }}</InstanceId>
             <LaunchConfigurationName>{{ group.launch_config_name }}</LaunchConfigurationName>
             <LifecycleState>{{ instance_state.lifecycle_state }}</LifecycleState>
+            <ProtectedFromScaleIn>{{ instance_state.protected_from_scale_in|string|lower }}</ProtectedFromScaleIn>
           </member>
           {% endfor %}
         </Instances>
@@ -495,6 +522,15 @@ DESCRIBE_AUTOSCALING_GROUPS_TEMPLATE = """<DescribeAutoScalingGroupsResponse xml
         {% else %}
           <LoadBalancerNames/>
         {% endif %}
+        {% if group.target_group_arns %}
+          <TargetGroupARNs>
+          {% for target_group_arn in group.target_group_arns %}
+            <member>{{ target_group_arn }}</member>
+          {% endfor %}
+          </TargetGroupARNs>
+        {% else %}
+          <TargetGroupARNs/>
+        {% endif %}
         <MinSize>{{ group.min_size }}</MinSize>
         {% if group.vpc_zone_identifier %}
           <VPCZoneIdentifier>{{ group.vpc_zone_identifier }}</VPCZoneIdentifier>
@@ -503,8 +539,7 @@ DESCRIBE_AUTOSCALING_GROUPS_TEMPLATE = """<DescribeAutoScalingGroupsResponse xml
         {% endif %}
         <HealthCheckGracePeriod>{{ group.health_check_period }}</HealthCheckGracePeriod>
         <DefaultCooldown>{{ group.default_cooldown }}</DefaultCooldown>
-        <AutoScalingGroupARN>arn:aws:autoscaling:us-east-1:803981987763:autoScalingGroup:ca861182-c8f9-4ca7-b1eb-cd35505f5ebb
-        :autoScalingGroupName/{{ group.name }}</AutoScalingGroupARN>
+        <AutoScalingGroupARN>arn:aws:autoscaling:us-east-1:803981987763:autoScalingGroup:ca861182-c8f9-4ca7-b1eb-cd35505f5ebb:autoScalingGroupName/{{ group.name }}</AutoScalingGroupARN>
         {% if group.termination_policies %}
         <TerminationPolicies>
           {% for policy in group.termination_policies %}
@@ -518,6 +553,7 @@ DESCRIBE_AUTOSCALING_GROUPS_TEMPLATE = """<DescribeAutoScalingGroupsResponse xml
         {% if group.placement_group %}
         <PlacementGroup>{{ group.placement_group }}</PlacementGroup>
         {% endif %}
+        <NewInstancesProtectedFromScaleIn>{{ group.new_instances_protected_from_scale_in|string|lower }}</NewInstancesProtectedFromScaleIn>
       </member>
       {% endfor %}
     </AutoScalingGroups>
@@ -553,6 +589,7 @@ DESCRIBE_AUTOSCALING_INSTANCES_TEMPLATE = """<DescribeAutoScalingInstancesRespon
         <InstanceId>{{ instance_state.instance.id }}</InstanceId>
         <LaunchConfigurationName>{{ instance_state.instance.autoscaling_group.launch_config_name }}</LaunchConfigurationName>
         <LifecycleState>{{ instance_state.lifecycle_state }}</LifecycleState>
+        <ProtectedFromScaleIn>{{ instance_state.protected_from_scale_in|string|lower }}</ProtectedFromScaleIn>
       </member>
       {% endfor %}
     </AutoScalingInstances>
@@ -644,9 +681,22 @@ DETACH_LOAD_BALANCERS_TEMPLATE = """<DetachLoadBalancersResponse xmlns="http://a
 </ResponseMetadata>
 </DetachLoadBalancersResponse>"""
 
+SUSPEND_PROCESSES_TEMPLATE = """<SuspendProcessesResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+<ResponseMetadata>
+   <RequestId>7c6e177f-f082-11e1-ac58-3714bEXAMPLE</RequestId>
+</ResponseMetadata>
+</SuspendProcessesResponse>"""
+
 SET_INSTANCE_HEALTH_TEMPLATE = """<SetInstanceHealthResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
 <SetInstanceHealthResponse></SetInstanceHealthResponse>
 <ResponseMetadata>
 <RequestId>{{ requestid }}</RequestId>
 </ResponseMetadata>
 </SetInstanceHealthResponse>"""
+
+SET_INSTANCE_PROTECTION_TEMPLATE = """<SetInstanceProtectionResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+<SetInstanceProtectionResult></SetInstanceProtectionResult>
+<ResponseMetadata>
+<RequestId>{{ requestid }}</RequestId>
+</ResponseMetadata>
+</SetInstanceProtectionResponse>"""

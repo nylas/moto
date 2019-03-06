@@ -70,6 +70,12 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |------------------------------------------------------------------------------|
 | CloudwatchEvents      | @mock_events     | all endpoints done                |
 |------------------------------------------------------------------------------|
+| Cognito Identity      | @mock_cognitoidentity| basic endpoints done          |
+|------------------------------------------------------------------------------|
+| Cognito Identity Provider | @mock_cognitoidp| basic endpoints done           |
+|------------------------------------------------------------------------------|
+| Config | @mock_config | basic endpoints done                                 |
+|------------------------------------------------------------------------------|
 | Data Pipeline         | @mock_datapipeline| basic endpoints done             |
 |------------------------------------------------------------------------------|
 | DynamoDB              | @mock_dynamodb   | core endpoints done               |
@@ -108,6 +114,8 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |------------------------------------------------------------------------------|
 | KMS                   | @mock_kms        | basic endpoints done              |
 |------------------------------------------------------------------------------|
+| Organizations         | @mock_organizations | some core endpoints done       |
+|------------------------------------------------------------------------------|
 | Polly                 | @mock_polly      | all endpoints done                |
 |------------------------------------------------------------------------------|
 | RDS                   | @mock_rds        | core endpoints done               |
@@ -119,6 +127,8 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 | Route53               | @mock_route53    | core endpoints done               |
 |------------------------------------------------------------------------------|
 | S3                    | @mock_s3         | core endpoints done               |
+|------------------------------------------------------------------------------|
+| SecretsManager        | @mock_secretsmanager | basic endpoints done
 |------------------------------------------------------------------------------|
 | SES                   | @mock_ses        | all endpoints done                |
 |------------------------------------------------------------------------------|
@@ -135,6 +145,8 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 | X-Ray                 | @mock_xray       | all endpoints done                |
 |------------------------------------------------------------------------------|
 ```
+
+For a full list of endpoint [implementation coverage](https://github.com/spulec/moto/blob/master/IMPLEMENTATION_COVERAGE.md)
 
 ### Another Example
 
@@ -167,7 +179,7 @@ def test_add_servers():
 ```
 
 #### Using moto 1.0.X with boto2
-moto 1.0.X mock docorators are defined for boto3 and do not work with boto2. Use the @mock_AWSSVC_deprecated to work with boto2.
+moto 1.0.X mock decorators are defined for boto3 and do not work with boto2. Use the @mock_AWSSVC_deprecated to work with boto2.
 
 Using moto with boto2
 ```python
@@ -249,7 +261,7 @@ It uses flask, which isn't a default dependency. You can install the
 server 'extra' package with:
 
 ```python
-pip install moto[server]
+pip install "moto[server]"
 ```
 
 You can then start it running a service:

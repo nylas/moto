@@ -138,3 +138,64 @@ class CrossLocationLoggingProhibitted(S3ClientError):
             "CrossLocationLoggingProhibitted",
             "Cross S3 location logging not allowed."
         )
+
+
+class InvalidNotificationARN(S3ClientError):
+    code = 400
+
+    def __init__(self, *args, **kwargs):
+        super(InvalidNotificationARN, self).__init__(
+            "InvalidArgument",
+            "The ARN is not well formed",
+            *args, **kwargs)
+
+
+class InvalidNotificationDestination(S3ClientError):
+    code = 400
+
+    def __init__(self, *args, **kwargs):
+        super(InvalidNotificationDestination, self).__init__(
+            "InvalidArgument",
+            "The notification destination service region is not valid for the bucket location constraint",
+            *args, **kwargs)
+
+
+class InvalidNotificationEvent(S3ClientError):
+    code = 400
+
+    def __init__(self, *args, **kwargs):
+        super(InvalidNotificationEvent, self).__init__(
+            "InvalidArgument",
+            "The event is not supported for notifications",
+            *args, **kwargs)
+
+
+class InvalidStorageClass(S3ClientError):
+    code = 400
+
+    def __init__(self, *args, **kwargs):
+        super(InvalidStorageClass, self).__init__(
+            "InvalidStorageClass",
+            "The storage class you specified is not valid",
+            *args, **kwargs)
+
+
+class InvalidBucketName(S3ClientError):
+    code = 400
+
+    def __init__(self, *args, **kwargs):
+        super(InvalidBucketName, self).__init__(
+            "InvalidBucketName",
+            "The specified bucket is not valid.",
+            *args, **kwargs
+        )
+
+
+class DuplicateTagKeys(S3ClientError):
+    code = 400
+
+    def __init__(self, *args, **kwargs):
+        super(DuplicateTagKeys, self).__init__(
+            "InvalidTag",
+            "Cannot provide multiple Tags with the same key",
+            *args, **kwargs)

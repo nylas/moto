@@ -19,6 +19,7 @@ test: lint
 	rm -f .coverage
 	rm -rf cover
 	@nosetests -sv --with-coverage --cover-html ./tests/ $(TEST_EXCLUDE)
+
 test_server:
 	@TEST_SERVER_MODE=true nosetests -sv --with-coverage --cover-html ./tests/
 
@@ -41,7 +42,7 @@ publish: upload_pypi_artifact \
 	push_dockerhub_image
 
 implementation_coverage:
-	./scripts/implementation_coverage.py > IMPLEMENTATION_COVERAGE.md
+	./scripts/implementation_coverage.py
 	git commit IMPLEMENTATION_COVERAGE.md -m "Updating implementation coverage" || true
 
 scaffold:

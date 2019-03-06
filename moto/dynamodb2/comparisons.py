@@ -29,8 +29,10 @@ COMPARISON_FUNCS = {
     'GT': GT_FUNCTION,
     '>': GT_FUNCTION,
 
-    'NULL': lambda item_value: item_value is None,
-    'NOT_NULL': lambda item_value: item_value is not None,
+    # NULL means the value should not exist at all
+    'NULL': lambda item_value: False,
+    # NOT_NULL means the value merely has to exist, and values of None are valid
+    'NOT_NULL': lambda item_value: True,
     'CONTAINS': lambda item_value, test_value: test_value in item_value,
     'NOT_CONTAINS': lambda item_value, test_value: test_value not in item_value,
     'BEGINS_WITH': lambda item_value, test_value: item_value.startswith(test_value),
@@ -176,6 +178,8 @@ def get_filter_expression(expr, names, values):
 
             next_token = six.next(token_iterator)
             while next_token != ')':
+                if next_token in values_map:
+                    next_token = values_map[next_token]
                 function_list.append(next_token)
                 next_token = six.next(token_iterator)
 
@@ -379,7 +383,7 @@ class OpNotEqual(Op):
     def expr(self, item):
         lhs = self._lhs(item)
         rhs = self._rhs(item)
-        return lhs == rhs
+        return lhs != rhs
 
 
 class OpLessThanOrEqual(Op):

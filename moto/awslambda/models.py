@@ -4,6 +4,7 @@ import base64
 from collections import defaultdict
 import copy
 import datetime
+import docker
 import docker.errors
 import hashlib
 import io
@@ -44,6 +45,7 @@ except ImportError:
 
 _stderr_regex = re.compile(r'START|END|REPORT RequestId: .*')
 _orig_adapter_send = requests.adapters.HTTPAdapter.send
+docker_3 = docker.__version__.startswith("3")
 
 
 def zip2tar(zip_bytes):
@@ -104,7 +106,11 @@ class _DockerDataVolumeContext:
 
             # It doesn't exist so we need to create it
             self._vol_ref.volume = self._lambda_func.docker_client.volumes.create(self._lambda_func.code_sha_256)
-            container = self._lambda_func.docker_client.containers.run('alpine', 'sleep 100', volumes={self.name: '/tmp/data'}, detach=True)
+            if docker_3:
+                volumes = {self.name: {'bind': '/tmp/data', 'mode': 'rw'}}
+            else:
+                volumes = {self.name: '/tmp/data'}
+            container = self._lambda_func.docker_client.containers.run('alpine', 'sleep 100', volumes=volumes, detach=True)
             try:
                 tar_bytes = zip2tar(self._lambda_func.code_bytes)
                 container.put_archive('/tmp/data', tar_bytes)
@@ -314,6 +320,10 @@ class LambdaFunction(BaseModel):
                             exit_code = -1
                             container.stop()
                             container.kill()
+                        else:
+                            if docker_3:
+                                exit_code = exit_code['StatusCode']
+
                         output = container.logs(stdout=False, stderr=True)
                         output += container.logs(stdout=True, stderr=False)
                         container.remove()
@@ -376,7 +386,7 @@ class LambdaFunction(BaseModel):
             'Role': properties['Role'],
             'Runtime': properties['Runtime'],
         }
-        optional_properties = 'Description MemorySize Publish Timeout VpcConfig'.split()
+        optional_properties = 'Description MemorySize Publish Timeout VpcConfig Environment'.split()
         # NOTE: Not doing `properties.get(k, DEFAULT)` to avoid duplicating the
         # default logic
         for prop in optional_properties:
@@ -445,6 +455,9 @@ class LambdaVersion(BaseModel):
     def __init__(self, spec):
         self.version = spec['Version']
 
+    def __repr__(self):
+        return str(self.logical_resource_id)
+
     @classmethod
     def create_from_cloudformation_json(cls, resource_name, cloudformation_json,
                                         region_name):
@@ -486,6 +499,11 @@ class LambdaStorage(object):
             return self._get_version(name, int(qualifier))
         except ValueError:
             return self._functions[name]['latest']
+
+    def list_versions_by_function(self, name):
+        if name not in self._functions:
+            return None
+        return [self._functions[name]['latest']]
 
     def get_arn(self, arn):
         return self._arns.get(arn, None)
@@ -594,6 +612,9 @@ class LambdaBackend(BaseBackend):
     def get_function(self, function_name, qualifier=None):
         return self._lambdas.get_function(function_name, qualifier)
 
+    def list_versions_by_function(self, function_name):
+        return self._lambdas.list_versions_by_function(function_name)
+
     def get_function_by_arn(self, function_arn):
         return self._lambdas.get_arn(function_arn)
 
@@ -603,7 +624,7 @@ class LambdaBackend(BaseBackend):
     def list_functions(self):
         return self._lambdas.all()
 
-    def send_message(self, function_name, message, subject=None):
+    def send_message(self, function_name, message, subject=None, qualifier=None):
         event = {
             "Records": [
                 {
@@ -636,8 +657,8 @@ class LambdaBackend(BaseBackend):
             ]
 
         }
-        self._functions[function_name][-1].invoke(json.dumps(event), {}, {})
-        pass
+        func = self._lambdas.get_function(function_name, qualifier)
+        func.invoke(json.dumps(event), {}, {})
 
     def list_tags(self, resource):
         return self.get_function_by_arn(resource).tags
@@ -675,3 +696,4 @@ lambda_backends = {_region.name: LambdaBackend(_region.name)
                    for _region in boto.awslambda.regions()}
 
 lambda_backends['ap-southeast-2'] = LambdaBackend('ap-southeast-2')
+lambda_backends['us-gov-west-1'] = LambdaBackend('us-gov-west-1')

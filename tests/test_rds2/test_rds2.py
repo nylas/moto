@@ -19,17 +19,21 @@ def test_create_database():
                                        MasterUserPassword='hunter2',
                                        Port=1234,
                                        DBSecurityGroups=["my_sg"])
-    database['DBInstance']['AllocatedStorage'].should.equal(10)
-    database['DBInstance']['DBInstanceClass'].should.equal("db.m1.small")
-    database['DBInstance']['LicenseModel'].should.equal("license-included")
-    database['DBInstance']['MasterUsername'].should.equal("root")
-    database['DBInstance']['DBSecurityGroups'][0][
+    db_instance = database['DBInstance']
+    db_instance['AllocatedStorage'].should.equal(10)
+    db_instance['DBInstanceClass'].should.equal("db.m1.small")
+    db_instance['LicenseModel'].should.equal("license-included")
+    db_instance['MasterUsername'].should.equal("root")
+    db_instance['DBSecurityGroups'][0][
         'DBSecurityGroupName'].should.equal('my_sg')
-    database['DBInstance']['DBInstanceArn'].should.equal(
+    db_instance['DBInstanceArn'].should.equal(
         'arn:aws:rds:us-west-2:1234567890:db:db-master-1')
-    database['DBInstance']['DBInstanceStatus'].should.equal('available')
-    database['DBInstance']['DBName'].should.equal('staging-postgres')
-    database['DBInstance']['DBInstanceIdentifier'].should.equal("db-master-1")
+    db_instance['DBInstanceStatus'].should.equal('available')
+    db_instance['DBName'].should.equal('staging-postgres')
+    db_instance['DBInstanceIdentifier'].should.equal("db-master-1")
+    db_instance['IAMDatabaseAuthenticationEnabled'].should.equal(False)
+    db_instance['DbiResourceId'].should.contain("db-")
+    db_instance['CopyTagsToSnapshot'].should.equal(False)
 
 
 @mock_rds2
@@ -197,6 +201,8 @@ def test_get_databases_paginated():
     resp2 = conn.describe_db_instances(Marker=resp["Marker"])
     resp2["DBInstances"].should.have.length_of(1)
 
+    resp3 = conn.describe_db_instances(MaxRecords=100)
+    resp3["DBInstances"].should.have.length_of(51)
 
 @mock_rds2
 def test_describe_non_existant_database():
@@ -334,6 +340,49 @@ def test_create_db_snapshots():
     snapshot.get('Engine').should.equal('postgres')
     snapshot.get('DBInstanceIdentifier').should.equal('db-primary-1')
     snapshot.get('DBSnapshotIdentifier').should.equal('g-1')
+    result = conn.list_tags_for_resource(ResourceName=snapshot['DBSnapshotArn'])
+    result['TagList'].should.equal([])
+
+
+@mock_rds2
+def test_create_db_snapshots_copy_tags():
+    conn = boto3.client('rds', region_name='us-west-2')
+    conn.create_db_snapshot.when.called_with(
+        DBInstanceIdentifier='db-primary-1',
+        DBSnapshotIdentifier='snapshot-1').should.throw(ClientError)
+
+    conn.create_db_instance(DBInstanceIdentifier='db-primary-1',
+                            AllocatedStorage=10,
+                            Engine='postgres',
+                            DBName='staging-postgres',
+                            DBInstanceClass='db.m1.small',
+                            MasterUsername='root',
+                            MasterUserPassword='hunter2',
+                            Port=1234,
+                            DBSecurityGroups=["my_sg"],
+                            CopyTagsToSnapshot=True,
+                            Tags=[
+                                {
+                                    'Key': 'foo',
+                                    'Value': 'bar',
+                                },
+                                {
+                                    'Key': 'foo1',
+                                    'Value': 'bar1',
+                                },
+                            ])
+
+    snapshot = conn.create_db_snapshot(DBInstanceIdentifier='db-primary-1',
+                                       DBSnapshotIdentifier='g-1').get('DBSnapshot')
+
+    snapshot.get('Engine').should.equal('postgres')
+    snapshot.get('DBInstanceIdentifier').should.equal('db-primary-1')
+    snapshot.get('DBSnapshotIdentifier').should.equal('g-1')
+    result = conn.list_tags_for_resource(ResourceName=snapshot['DBSnapshotArn'])
+    result['TagList'].should.equal([{'Value': 'bar',
+                                     'Key': 'foo'},
+                                    {'Value': 'bar1',
+                                     'Key': 'foo1'}])
 
 
 @mock_rds2
@@ -348,8 +397,6 @@ def test_describe_db_snapshots():
                             MasterUserPassword='hunter2',
                             Port=1234,
                             DBSecurityGroups=["my_sg"])
-    conn.describe_db_snapshots.when.called_with(
-        DBInstanceIdentifier="db-primary-1").should.throw(ClientError)
 
     created = conn.create_db_snapshot(DBInstanceIdentifier='db-primary-1',
                                       DBSnapshotIdentifier='snapshot-1').get('DBSnapshot')
@@ -363,6 +410,11 @@ def test_describe_db_snapshots():
     snapshot = by_snapshot_id[0]
     snapshot.should.equal(created)
     snapshot.get('Engine').should.equal('postgres')
+
+    conn.create_db_snapshot(DBInstanceIdentifier='db-primary-1',
+                            DBSnapshotIdentifier='snapshot-2')
+    snapshots = conn.describe_db_snapshots(DBInstanceIdentifier='db-primary-1').get('DBSnapshots')
+    snapshots.should.have.length_of(2)
 
 
 @mock_rds2
@@ -645,6 +697,117 @@ def test_remove_tags_db():
         ResourceName='arn:aws:rds:us-west-2:1234567890:db:db-with-tags', TagKeys=['foo'])
     result = conn.list_tags_for_resource(
         ResourceName='arn:aws:rds:us-west-2:1234567890:db:db-with-tags')
+    len(result['TagList']).should.equal(1)
+
+
+@mock_rds2
+def test_list_tags_snapshot():
+    conn = boto3.client('rds', region_name='us-west-2')
+    result = conn.list_tags_for_resource(
+        ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:foo')
+    result['TagList'].should.equal([])
+    conn.create_db_instance(DBInstanceIdentifier='db-primary-1',
+                            AllocatedStorage=10,
+                            Engine='postgres',
+                            DBName='staging-postgres',
+                            DBInstanceClass='db.m1.small',
+                            MasterUsername='root',
+                            MasterUserPassword='hunter2',
+                            Port=1234,
+                            DBSecurityGroups=["my_sg"])
+    snapshot = conn.create_db_snapshot(DBInstanceIdentifier='db-primary-1',
+                                       DBSnapshotIdentifier='snapshot-with-tags',
+                                       Tags=[
+                                           {
+                                               'Key': 'foo',
+                                               'Value': 'bar',
+                                           },
+                                           {
+                                               'Key': 'foo1',
+                                               'Value': 'bar1',
+                                           },
+                                       ])
+    result = conn.list_tags_for_resource(ResourceName=snapshot['DBSnapshot']['DBSnapshotArn'])
+    result['TagList'].should.equal([{'Value': 'bar',
+                                     'Key': 'foo'},
+                                    {'Value': 'bar1',
+                                     'Key': 'foo1'}])
+
+
+@mock_rds2
+def test_add_tags_snapshot():
+    conn = boto3.client('rds', region_name='us-west-2')
+    conn.create_db_instance(DBInstanceIdentifier='db-primary-1',
+                            AllocatedStorage=10,
+                            Engine='postgres',
+                            DBName='staging-postgres',
+                            DBInstanceClass='db.m1.small',
+                            MasterUsername='root',
+                            MasterUserPassword='hunter2',
+                            Port=1234,
+                            DBSecurityGroups=["my_sg"])
+    snapshot = conn.create_db_snapshot(DBInstanceIdentifier='db-primary-1',
+                                       DBSnapshotIdentifier='snapshot-without-tags',
+                                       Tags=[
+                                           {
+                                               'Key': 'foo',
+                                               'Value': 'bar',
+                                           },
+                                           {
+                                               'Key': 'foo1',
+                                               'Value': 'bar1',
+                                           },
+                                       ])
+    result = conn.list_tags_for_resource(
+        ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:snapshot-without-tags')
+    list(result['TagList']).should.have.length_of(2)
+    conn.add_tags_to_resource(ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:snapshot-without-tags',
+                              Tags=[
+                                  {
+                                      'Key': 'foo',
+                                      'Value': 'fish',
+                                  },
+                                  {
+                                      'Key': 'foo2',
+                                      'Value': 'bar2',
+                                  },
+                              ])
+    result = conn.list_tags_for_resource(
+        ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:snapshot-without-tags')
+    list(result['TagList']).should.have.length_of(3)
+
+
+@mock_rds2
+def test_remove_tags_snapshot():
+    conn = boto3.client('rds', region_name='us-west-2')
+    conn.create_db_instance(DBInstanceIdentifier='db-primary-1',
+                            AllocatedStorage=10,
+                            Engine='postgres',
+                            DBName='staging-postgres',
+                            DBInstanceClass='db.m1.small',
+                            MasterUsername='root',
+                            MasterUserPassword='hunter2',
+                            Port=1234,
+                            DBSecurityGroups=["my_sg"])
+    snapshot = conn.create_db_snapshot(DBInstanceIdentifier='db-primary-1',
+                                       DBSnapshotIdentifier='snapshot-with-tags',
+                                       Tags=[
+                                           {
+                                               'Key': 'foo',
+                                               'Value': 'bar',
+                                           },
+                                           {
+                                               'Key': 'foo1',
+                                               'Value': 'bar1',
+                                           },
+                                       ])
+    result = conn.list_tags_for_resource(
+        ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:snapshot-with-tags')
+    list(result['TagList']).should.have.length_of(2)
+    conn.remove_tags_from_resource(
+        ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:snapshot-with-tags', TagKeys=['foo'])
+    result = conn.list_tags_for_resource(
+        ResourceName='arn:aws:rds:us-west-2:1234567890:snapshot:snapshot-with-tags')
     len(result['TagList']).should.equal(1)
 
 

@@ -80,13 +80,13 @@ class KinesisResponse(BaseResponse):
         shard_iterator = self.parameters.get("ShardIterator")
         limit = self.parameters.get("Limit")
 
-        next_shard_iterator, records = self.kinesis_backend.get_records(
+        next_shard_iterator, records, millis_behind_latest = self.kinesis_backend.get_records(
             shard_iterator, limit)
 
         return json.dumps({
             "NextShardIterator": next_shard_iterator,
             "Records": [record.to_json() for record in records],
-            "MillisBehindLatest": 0
+            'MillisBehindLatest': millis_behind_latest
         })
 
     def put_record(self):

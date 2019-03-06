@@ -13,6 +13,7 @@ from pkg_resources import resource_filename
 import boto.ec2
 
 from collections import defaultdict
+import weakref
 from datetime import datetime
 from boto.ec2.instance import Instance as BotoInstance, Reservation
 from boto.ec2.blockdevicemapping import BlockDeviceMapping, BlockDeviceType
@@ -24,51 +25,54 @@ from moto.core import BaseBackend
 from moto.core.models import Model, BaseModel
 from moto.core.utils import iso_8601_datetime_with_milliseconds, camelcase_to_underscores
 from .exceptions import (
-    EC2ClientError,
+    CidrLimitExceeded,
     DependencyViolationError,
-    MissingParameterError,
+    EC2ClientError,
+    FilterNotImplementedError,
+    GatewayNotAttachedError,
+    InvalidAddressError,
+    InvalidAllocationIdError,
+    InvalidAMIIdError,
+    InvalidAMIAttributeItemValueError,
+    InvalidAssociationIdError,
+    InvalidCIDRSubnetError,
+    InvalidCustomerGatewayIdError,
+    InvalidDHCPOptionsIdError,
+    InvalidDomainError,
+    InvalidID,
+    InvalidInstanceIdError,
+    InvalidInternetGatewayIdError,
+    InvalidKeyPairDuplicateError,
+    InvalidKeyPairNameError,
+    InvalidNetworkAclIdError,
+    InvalidNetworkAttachmentIdError,
+    InvalidNetworkInterfaceIdError,
     InvalidParameterValueError,
     InvalidParameterValueErrorTagNull,
-    InvalidDHCPOptionsIdError,
-    MalformedDHCPOptionsIdError,
-    InvalidKeyPairNameError,
-    InvalidKeyPairDuplicateError,
-    InvalidInternetGatewayIdError,
-    GatewayNotAttachedError,
-    ResourceAlreadyAssociatedError,
-    InvalidVPCIdError,
-    InvalidSubnetIdError,
-    InvalidNetworkInterfaceIdError,
-    InvalidNetworkAttachmentIdError,
-    InvalidSecurityGroupDuplicateError,
-    InvalidSecurityGroupNotFoundError,
     InvalidPermissionNotFoundError,
     InvalidPermissionDuplicateError,
     InvalidRouteTableIdError,
     InvalidRouteError,
-    InvalidInstanceIdError,
-    InvalidAMIIdError,
-    InvalidAMIAttributeItemValueError,
+    InvalidSecurityGroupDuplicateError,
+    InvalidSecurityGroupNotFoundError,
     InvalidSnapshotIdError,
+    InvalidSubnetIdError,
     InvalidVolumeIdError,
     InvalidVolumeAttachmentError,
-    InvalidDomainError,
-    InvalidAddressError,
-    InvalidAllocationIdError,
-    InvalidAssociationIdError,
+    InvalidVpcCidrBlockAssociationIdError,
     InvalidVPCPeeringConnectionIdError,
     InvalidVPCPeeringConnectionStateTransitionError,
-    TagLimitExceeded,
-    InvalidID,
-    InvalidCIDRSubnetError,
-    InvalidNetworkAclIdError,
+    InvalidVPCIdError,
     InvalidVpnGatewayIdError,
     InvalidVpnConnectionIdError,
-    InvalidCustomerGatewayIdError,
-    RulesPerSecurityGroupLimitExceededError,
+    MalformedAMIIdError,
+    MalformedDHCPOptionsIdError,
+    MissingParameterError,
     MotoNotImplementedError,
-    FilterNotImplementedError,
-    MalformedAMIIdError)
+    OperationNotPermitted,
+    ResourceAlreadyAssociatedError,
+    RulesPerSecurityGroupLimitExceededError,
+    TagLimitExceeded)
 from .utils import (
     EC2_RESOURCE_TO_PREFIX,
     EC2_PREFIX_TO_RESOURCE,
@@ -81,6 +85,7 @@ from .utils import (
     random_instance_id,
     random_internet_gateway_id,
     random_ip,
+    random_ipv6_cidr,
     random_nat_gateway_id,
     random_key_pair,
     random_private_ip,
@@ -97,6 +102,7 @@ from .utils import (
     random_subnet_association_id,
     random_volume_id,
     random_vpc_id,
+    random_vpc_cidr_association_id,
     random_vpc_peering_connection_id,
     generic_filter,
     is_valid_resource_id,
@@ -382,6 +388,7 @@ class Instance(TaggedEC2Resource, BotoInstance):
         self.ebs_optimized = kwargs.get("ebs_optimized", False)
         self.source_dest_check = "true"
         self.launch_time = utc_date_and_time()
+        self.ami_launch_index = kwargs.get("ami_launch_index", 0)
         self.disable_api_termination = kwargs.get("disable_api_termination", False)
         self._spot_fleet_id = kwargs.get("spot_fleet_id", None)
         associate_public_ip = kwargs.get("associate_public_ip", False)
@@ -713,6 +720,7 @@ class InstanceBackend(object):
         instance_tags = tags.get('instance', {})
 
         for index in range(count):
+            kwargs["ami_launch_index"] = index
             new_instance = Instance(
                 self,
                 image_id,
@@ -1088,7 +1096,8 @@ class Ami(TaggedEC2Resource):
         # AWS auto-creates these, we should reflect the same.
         volume = self.ec2_backend.create_volume(15, region_name)
         self.ebs_snapshot = self.ec2_backend.create_snapshot(
-            volume.id, "Auto-created snapshot for AMI %s" % self.id)
+            volume.id, "Auto-created snapshot for AMI %s" % self.id, owner_id)
+        self.ec2_backend.delete_volume(volume.id)
 
     @property
     def is_public(self):
@@ -1108,7 +1117,7 @@ class Ami(TaggedEC2Resource):
         elif filter_name == 'image-id':
             return self.id
         elif filter_name == 'is-public':
-            return str(self.is_public)
+            return self.is_public_string
         elif filter_name == 'state':
             return self.state
         elif filter_name == 'name':
@@ -1318,7 +1327,7 @@ class SecurityGroup(TaggedEC2Resource):
         self.name = name
         self.description = description
         self.ingress_rules = []
-        self.egress_rules = [SecurityRule(-1, -1, -1, ['0.0.0.0/0'], [])]
+        self.egress_rules = [SecurityRule(-1, None, None, ['0.0.0.0/0'], [])]
         self.enis = {}
         self.vpc_id = vpc_id
         self.owner_id = "123456789012"
@@ -1709,6 +1718,7 @@ class SecurityGroupIngress(object):
         group_id = properties.get('GroupId')
         ip_protocol = properties.get("IpProtocol")
         cidr_ip = properties.get("CidrIp")
+        cidr_ipv6 = properties.get("CidrIpv6")
         from_port = properties.get("FromPort")
         source_security_group_id = properties.get("SourceSecurityGroupId")
         source_security_group_name = properties.get("SourceSecurityGroupName")
@@ -1717,7 +1727,7 @@ class SecurityGroupIngress(object):
         to_port = properties.get("ToPort")
 
         assert group_id or group_name
-        assert source_security_group_name or cidr_ip or source_security_group_id
+        assert source_security_group_name or cidr_ip or cidr_ipv6 or source_security_group_id
         assert ip_protocol
 
         if source_security_group_id:
@@ -1833,13 +1843,15 @@ class Volume(TaggedEC2Resource):
             return self.id
         elif filter_name == 'encrypted':
             return str(self.encrypted).lower()
+        elif filter_name == 'availability-zone':
+            return self.zone.name
         else:
             return super(Volume, self).get_filter_value(
                 filter_name, 'DescribeVolumes')
 
 
 class Snapshot(TaggedEC2Resource):
-    def __init__(self, ec2_backend, snapshot_id, volume, description, encrypted=False):
+    def __init__(self, ec2_backend, snapshot_id, volume, description, encrypted=False, owner_id='123456789012'):
         self.id = snapshot_id
         self.volume = volume
         self.description = description
@@ -1848,6 +1860,7 @@ class Snapshot(TaggedEC2Resource):
         self.ec2_backend = ec2_backend
         self.status = 'completed'
         self.encrypted = encrypted
+        self.owner_id = owner_id
 
     def get_filter_value(self, filter_name):
         if filter_name == 'description':
@@ -1939,11 +1952,13 @@ class EBSBackend(object):
         volume.attachment = None
         return old_attachment
 
-    def create_snapshot(self, volume_id, description):
+    def create_snapshot(self, volume_id, description, owner_id=None):
         snapshot_id = random_snapshot_id()
         volume = self.get_volume(volume_id)
-        snapshot = Snapshot(self, snapshot_id, volume,
-                            description, volume.encrypted)
+        params = [self, snapshot_id, volume, description, volume.encrypted]
+        if owner_id:
+            params.append(owner_id)
+        snapshot = Snapshot(*params)
         self.snapshots[snapshot_id] = snapshot
         return snapshot
 
@@ -1958,6 +1973,15 @@ class EBSBackend(object):
         if filters:
             matches = generic_filter(filters, matches)
         return matches
+
+    def copy_snapshot(self, source_snapshot_id, source_region, description=None):
+        source_snapshot = ec2_backends[source_region].describe_snapshots(
+            snapshot_ids=[source_snapshot_id])[0]
+        snapshot_id = random_snapshot_id()
+        snapshot = Snapshot(self, snapshot_id, volume=source_snapshot.volume,
+            description=description, encrypted=source_snapshot.encrypted)
+        self.snapshots[snapshot_id] = snapshot
+        return snapshot
 
     def get_snapshot(self, snapshot_id):
         snapshot = self.snapshots.get(snapshot_id, None)
@@ -1998,10 +2022,13 @@ class EBSBackend(object):
 
 
 class VPC(TaggedEC2Resource):
-    def __init__(self, ec2_backend, vpc_id, cidr_block, is_default, instance_tenancy='default'):
+    def __init__(self, ec2_backend, vpc_id, cidr_block, is_default, instance_tenancy='default',
+                 amazon_provided_ipv6_cidr_block=False):
+
         self.ec2_backend = ec2_backend
         self.id = vpc_id
         self.cidr_block = cidr_block
+        self.cidr_block_association_set = {}
         self.dhcp_options = None
         self.state = 'available'
         self.instance_tenancy = instance_tenancy
@@ -2010,6 +2037,10 @@ class VPC(TaggedEC2Resource):
         # This attribute is set to 'true' only for default VPCs
         # or VPCs created using the wizard of the VPC console
         self.enable_dns_hostnames = 'true' if is_default else 'false'
+
+        self.associate_vpc_cidr_block(cidr_block)
+        if amazon_provided_ipv6_cidr_block:
+            self.associate_vpc_cidr_block(cidr_block, amazon_provided_ipv6_cidr_block=amazon_provided_ipv6_cidr_block)
 
     @classmethod
     def create_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
@@ -2036,6 +2067,12 @@ class VPC(TaggedEC2Resource):
             return self.id
         elif filter_name in ('cidr', 'cidr-block', 'cidrBlock'):
             return self.cidr_block
+        elif filter_name in ('cidr-block-association.cidr-block', 'ipv6-cidr-block-association.ipv6-cidr-block'):
+            return [c['cidr_block'] for c in self.get_cidr_block_association_set(ipv6='ipv6' in filter_name)]
+        elif filter_name in ('cidr-block-association.association-id', 'ipv6-cidr-block-association.association-id'):
+            return self.cidr_block_association_set.keys()
+        elif filter_name in ('cidr-block-association.state', 'ipv6-cidr-block-association.state'):
+            return [c['cidr_block_state']['state'] for c in self.get_cidr_block_association_set(ipv6='ipv6' in filter_name)]
         elif filter_name in ('instance_tenancy', 'InstanceTenancy'):
             return self.instance_tenancy
         elif filter_name in ('is-default', 'isDefault'):
@@ -2047,19 +2084,57 @@ class VPC(TaggedEC2Resource):
                 return None
             return self.dhcp_options.id
         else:
-            return super(VPC, self).get_filter_value(
-                filter_name, 'DescribeVpcs')
+            return super(VPC, self).get_filter_value(filter_name, 'DescribeVpcs')
+
+    def associate_vpc_cidr_block(self, cidr_block, amazon_provided_ipv6_cidr_block=False):
+        max_associations = 5 if not amazon_provided_ipv6_cidr_block else 1
+
+        if len(self.get_cidr_block_association_set(amazon_provided_ipv6_cidr_block)) >= max_associations:
+            raise CidrLimitExceeded(self.id, max_associations)
+
+        association_id = random_vpc_cidr_association_id()
+
+        association_set = {
+            'association_id': association_id,
+            'cidr_block_state': {'state': 'associated', 'StatusMessage': ''}
+        }
+
+        association_set['cidr_block'] = random_ipv6_cidr() if amazon_provided_ipv6_cidr_block else cidr_block
+        self.cidr_block_association_set[association_id] = association_set
+        return association_set
+
+    def disassociate_vpc_cidr_block(self, association_id):
+        if self.cidr_block == self.cidr_block_association_set.get(association_id, {}).get('cidr_block'):
+            raise OperationNotPermitted(association_id)
+
+        response = self.cidr_block_association_set.pop(association_id, {})
+        if response:
+            response['vpc_id'] = self.id
+            response['cidr_block_state']['state'] = 'disassociating'
+        return response
+
+    def get_cidr_block_association_set(self, ipv6=False):
+        return [c for c in self.cidr_block_association_set.values() if ('::/' if ipv6 else '.') in c.get('cidr_block')]
 
 
 class VPCBackend(object):
+    __refs__ = defaultdict(list)
+
     def __init__(self):
         self.vpcs = {}
+        self.__refs__[self.__class__].append(weakref.ref(self))
         super(VPCBackend, self).__init__()
 
-    def create_vpc(self, cidr_block, instance_tenancy='default'):
+    @classmethod
+    def get_instances(cls):
+        for inst_ref in cls.__refs__[cls]:
+            inst = inst_ref()
+            if inst is not None:
+                yield inst
+
+    def create_vpc(self, cidr_block, instance_tenancy='default', amazon_provided_ipv6_cidr_block=False):
         vpc_id = random_vpc_id()
-        vpc = VPC(self, vpc_id, cidr_block, len(
-            self.vpcs) == 0, instance_tenancy)
+        vpc = VPC(self, vpc_id, cidr_block, len(self.vpcs) == 0, instance_tenancy, amazon_provided_ipv6_cidr_block)
         self.vpcs[vpc_id] = vpc
 
         # AWS creates a default main route table and security group.
@@ -2079,6 +2154,13 @@ class VPCBackend(object):
         if vpc_id not in self.vpcs:
             raise InvalidVPCIdError(vpc_id)
         return self.vpcs.get(vpc_id)
+
+    # get vpc by vpc id and aws region
+    def get_cross_vpc(self, vpc_id, peer_region):
+        for vpcs in self.get_instances():
+            if vpcs.region_name == peer_region:
+                match_vpc = vpcs.get_vpc(vpc_id)
+        return match_vpc
 
     def get_all_vpcs(self, vpc_ids=None, filters=None):
         matches = self.vpcs.values()
@@ -2132,11 +2214,27 @@ class VPCBackend(object):
         else:
             raise InvalidParameterValueError(attr_name)
 
+    def disassociate_vpc_cidr_block(self, association_id):
+        for vpc in self.vpcs.values():
+            response = vpc.disassociate_vpc_cidr_block(association_id)
+            if response:
+                return response
+        else:
+            raise InvalidVpcCidrBlockAssociationIdError(association_id)
+
+    def associate_vpc_cidr_block(self, vpc_id, cidr_block, amazon_provided_ipv6_cidr_block):
+        vpc = self.get_vpc(vpc_id)
+        return vpc.associate_vpc_cidr_block(cidr_block, amazon_provided_ipv6_cidr_block)
+
 
 class VPCPeeringConnectionStatus(object):
     def __init__(self, code='initiating-request', message=''):
         self.code = code
         self.message = message
+
+    def deleted(self):
+        self.code = 'deleted'
+        self.message = 'Deleted by {deleter ID}'
 
     def initiating(self):
         self.code = 'initiating-request'
@@ -2200,9 +2298,8 @@ class VPCPeeringConnectionBackend(object):
         return self.vpc_pcxs.get(vpc_pcx_id)
 
     def delete_vpc_peering_connection(self, vpc_pcx_id):
-        deleted = self.vpc_pcxs.pop(vpc_pcx_id, None)
-        if not deleted:
-            raise InvalidVPCPeeringConnectionIdError(vpc_pcx_id)
+        deleted = self.get_vpc_peering_connection(vpc_pcx_id)
+        deleted._status.deleted()
         return deleted
 
     def accept_vpc_peering_connection(self, vpc_pcx_id):
@@ -2369,7 +2466,7 @@ class SubnetBackend(object):
                         default_for_az, map_public_ip_on_launch)
 
         # AWS associates a new subnet with the default Network ACL
-        self.associate_default_network_acl_with_subnet(subnet_id)
+        self.associate_default_network_acl_with_subnet(subnet_id, vpc_id)
         self.subnets[availability_zone][subnet_id] = subnet
         return subnet
 
@@ -2590,7 +2687,7 @@ class Route(object):
         ec2_backend = ec2_backends[region_name]
         route_table = ec2_backend.create_route(
             route_table_id=route_table_id,
-            destination_cidr_block=properties['DestinationCidrBlock'],
+            destination_cidr_block=properties.get('DestinationCidrBlock'),
             gateway_id=gateway_id,
             instance_id=instance_id,
             interface_id=interface_id,
@@ -2784,7 +2881,7 @@ class SpotInstanceRequest(BotoSpotRequest, TaggedEC2Resource):
     def __init__(self, ec2_backend, spot_request_id, price, image_id, type,
                  valid_from, valid_until, launch_group, availability_zone_group,
                  key_name, security_groups, user_data, instance_type, placement,
-                 kernel_id, ramdisk_id, monitoring_enabled, subnet_id, spot_fleet_id,
+                 kernel_id, ramdisk_id, monitoring_enabled, subnet_id, tags, spot_fleet_id,
                  **kwargs):
         super(SpotInstanceRequest, self).__init__(**kwargs)
         ls = LaunchSpecification()
@@ -2808,6 +2905,7 @@ class SpotInstanceRequest(BotoSpotRequest, TaggedEC2Resource):
         ls.monitored = monitoring_enabled
         ls.subnet_id = subnet_id
         self.spot_fleet_id = spot_fleet_id
+        self.tags = tags
 
         if security_groups:
             for group_name in security_groups:
@@ -2841,6 +2939,7 @@ class SpotInstanceRequest(BotoSpotRequest, TaggedEC2Resource):
             security_group_names=[],
             security_group_ids=self.launch_specification.groups,
             spot_fleet_id=self.spot_fleet_id,
+            tags=self.tags,
         )
         instance = reservation.instances[0]
         return instance
@@ -2856,15 +2955,16 @@ class SpotRequestBackend(object):
                                valid_until, launch_group, availability_zone_group,
                                key_name, security_groups, user_data,
                                instance_type, placement, kernel_id, ramdisk_id,
-                               monitoring_enabled, subnet_id, spot_fleet_id=None):
+                               monitoring_enabled, subnet_id, tags=None, spot_fleet_id=None):
         requests = []
+        tags = tags or {}
         for _ in range(count):
             spot_request_id = random_spot_request_id()
             request = SpotInstanceRequest(self,
                                           spot_request_id, price, image_id, type, valid_from, valid_until,
                                           launch_group, availability_zone_group, key_name, security_groups,
                                           user_data, instance_type, placement, kernel_id, ramdisk_id,
-                                          monitoring_enabled, subnet_id, spot_fleet_id)
+                                          monitoring_enabled, subnet_id, tags, spot_fleet_id)
             self.spot_instance_requests[spot_request_id] = request
             requests.append(request)
         return requests
@@ -2884,8 +2984,8 @@ class SpotRequestBackend(object):
 
 class SpotFleetLaunchSpec(object):
     def __init__(self, ebs_optimized, group_set, iam_instance_profile, image_id,
-                 instance_type, key_name, monitoring, spot_price, subnet_id, user_data,
-                 weighted_capacity):
+                 instance_type, key_name, monitoring, spot_price, subnet_id, tag_specifications,
+                 user_data, weighted_capacity):
         self.ebs_optimized = ebs_optimized
         self.group_set = group_set
         self.iam_instance_profile = iam_instance_profile
@@ -2895,6 +2995,7 @@ class SpotFleetLaunchSpec(object):
         self.monitoring = monitoring
         self.spot_price = spot_price
         self.subnet_id = subnet_id
+        self.tag_specifications = tag_specifications
         self.user_data = user_data
         self.weighted_capacity = float(weighted_capacity)
 
@@ -2925,6 +3026,7 @@ class SpotFleetRequest(TaggedEC2Resource):
                 monitoring=spec.get('monitoring._enabled'),
                 spot_price=spec.get('spot_price', self.spot_price),
                 subnet_id=spec['subnet_id'],
+                tag_specifications=self._parse_tag_specifications(spec),
                 user_data=spec.get('user_data'),
                 weighted_capacity=spec['weighted_capacity'],
             )
@@ -3007,6 +3109,7 @@ class SpotFleetRequest(TaggedEC2Resource):
                 monitoring_enabled=launch_spec.monitoring,
                 subnet_id=launch_spec.subnet_id,
                 spot_fleet_id=self.id,
+                tags=launch_spec.tag_specifications,
             )
             self.spot_requests.extend(requests)
         self.fulfilled_capacity += added_weight
@@ -3028,6 +3131,25 @@ class SpotFleetRequest(TaggedEC2Resource):
 
         self.spot_requests = [req for req in self.spot_requests if req.instance.id not in instance_ids]
         self.ec2_backend.terminate_instances(instance_ids)
+
+    def _parse_tag_specifications(self, spec):
+        try:
+            tag_spec_num = max([int(key.split('.')[1]) for key in spec if key.startswith("tag_specification_set")])
+        except ValueError:  # no tag specifications
+            return {}
+
+        tag_specifications = {}
+        for si in range(1, tag_spec_num + 1):
+            resource_type = spec["tag_specification_set.{si}._resource_type".format(si=si)]
+
+            tags = [key for key in spec if key.startswith("tag_specification_set.{si}._tag".format(si=si))]
+            tag_num = max([int(key.split('.')[3]) for key in tags])
+            tag_specifications[resource_type] = dict((
+                spec["tag_specification_set.{si}._tag.{ti}._key".format(si=si, ti=ti)],
+                spec["tag_specification_set.{si}._tag.{ti}._value".format(si=si, ti=ti)],
+            ) for ti in range(1, tag_num + 1))
+
+        return tag_specifications
 
 
 class SpotFleetBackend(object):
@@ -3085,8 +3207,11 @@ class SpotFleetBackend(object):
 
 
 class ElasticAddress(object):
-    def __init__(self, domain):
-        self.public_ip = random_ip()
+    def __init__(self, domain, address=None):
+        if address:
+            self.public_ip = address
+        else:
+            self.public_ip = random_ip()
         self.allocation_id = random_eip_allocation_id() if domain == "vpc" else None
         self.domain = domain
         self.instance = None
@@ -3148,11 +3273,13 @@ class ElasticAddressBackend(object):
         self.addresses = []
         super(ElasticAddressBackend, self).__init__()
 
-    def allocate_address(self, domain):
+    def allocate_address(self, domain, address=None):
         if domain not in ['standard', 'vpc']:
             raise InvalidDomainError(domain)
-
-        address = ElasticAddress(domain)
+        if address:
+            address = ElasticAddress(domain, address)
+        else:
+            address = ElasticAddress(domain)
         self.addresses.append(address)
         return address
 
@@ -3460,7 +3587,21 @@ class NetworkAclBackend(object):
         self.get_vpc(vpc_id)
         network_acl = NetworkAcl(self, network_acl_id, vpc_id, default)
         self.network_acls[network_acl_id] = network_acl
+        if default:
+            self.add_default_entries(network_acl_id)
         return network_acl
+
+    def add_default_entries(self, network_acl_id):
+        default_acl_entries = [
+            {'rule_number': 100, 'rule_action': 'allow', 'egress': 'true'},
+            {'rule_number': 32767, 'rule_action': 'deny', 'egress': 'true'},
+            {'rule_number': 100, 'rule_action': 'allow', 'egress': 'false'},
+            {'rule_number': 32767, 'rule_action': 'deny', 'egress': 'false'}
+        ]
+        for entry in default_acl_entries:
+            self.create_network_acl_entry(network_acl_id=network_acl_id, rule_number=entry['rule_number'], protocol='-1',
+                                          rule_action=entry['rule_action'], egress=entry['egress'], cidr_block='0.0.0.0/0',
+                                          icmp_code=None, icmp_type=None, port_range_from=None, port_range_to=None)
 
     def get_all_network_acls(self, network_acl_ids=None, filters=None):
         network_acls = self.network_acls.values()
@@ -3536,9 +3677,9 @@ class NetworkAclBackend(object):
         new_acl.associations[new_assoc_id] = association
         return association
 
-    def associate_default_network_acl_with_subnet(self, subnet_id):
+    def associate_default_network_acl_with_subnet(self, subnet_id, vpc_id):
         association_id = random_network_acl_subnet_association_id()
-        acl = next(acl for acl in self.network_acls.values() if acl.default)
+        acl = next(acl for acl in self.network_acls.values() if acl.default and acl.vpc_id == vpc_id)
         acl.associations[association_id] = NetworkAclAssociation(self, association_id,
                                                                  subnet_id, acl.id)
 

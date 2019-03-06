@@ -8,6 +8,7 @@ from functools import wraps
 from gzip import GzipFile
 from io import BytesIO
 import zlib
+import pickle
 
 import json
 import boto
@@ -63,6 +64,50 @@ class MyModel(object):
     def save(self):
         s3 = boto3.client('s3', region_name='us-east-1')
         s3.put_object(Bucket='mybucket', Key=self.name, Body=self.value)
+
+
+@mock_s3
+def test_keys_are_pickleable():
+    """Keys must be pickleable due to boto3 implementation details."""
+    key = s3model.FakeKey('name', b'data!')
+    assert key.value == b'data!'
+
+    pickled = pickle.dumps(key)
+    loaded = pickle.loads(pickled)
+    assert loaded.value == key.value
+
+
+@mock_s3
+def test_append_to_value__basic():
+    key = s3model.FakeKey('name', b'data!')
+    assert key.value == b'data!'
+    assert key.size == 5
+
+    key.append_to_value(b' And even more data')
+    assert key.value == b'data! And even more data'
+    assert key.size == 24
+
+
+@mock_s3
+def test_append_to_value__nothing_added():
+    key = s3model.FakeKey('name', b'data!')
+    assert key.value == b'data!'
+    assert key.size == 5
+
+    key.append_to_value(b'')
+    assert key.value == b'data!'
+    assert key.size == 5
+
+
+@mock_s3
+def test_append_to_value__empty_key():
+    key = s3model.FakeKey('name', b'')
+    assert key.value == b''
+    assert key.size == 0
+
+    key.append_to_value(b'stuff')
+    assert key.value == b'stuff'
+    assert key.size == 5
 
 
 @mock_s3
@@ -225,6 +270,29 @@ def test_multipart_invalid_order():
     bucket.complete_multipart_upload.when.called_with(
         multipart.key_name, multipart.id, xml).should.throw(S3ResponseError)
 
+@mock_s3_deprecated
+@reduced_min_part_size
+def test_multipart_etag_quotes_stripped():
+    # Create Bucket so that test can run
+    conn = boto.connect_s3('the_key', 'the_secret')
+    bucket = conn.create_bucket('mybucket')
+
+    multipart = bucket.initiate_multipart_upload("the-key")
+    part1 = b'0' * REDUCED_PART_SIZE
+    etag1 = multipart.upload_part_from_file(BytesIO(part1), 1).etag
+    # last part, can be less than 5 MB
+    part2 = b'1'
+    etag2 = multipart.upload_part_from_file(BytesIO(part2), 2).etag
+    # Strip quotes from etags
+    etag1 = etag1.replace('"','')
+    etag2 = etag2.replace('"','')
+    xml = "<Part><PartNumber>{0}</PartNumber><ETag>{1}</ETag></Part>"
+    xml = xml.format(1, etag1) + xml.format(2, etag2)
+    xml = "<CompleteMultipartUpload>{0}</CompleteMultipartUpload>".format(xml)
+    bucket.complete_multipart_upload.when.called_with(
+        multipart.key_name, multipart.id, xml).should_not.throw(S3ResponseError)
+    # we should get both parts as the key contents
+    bucket.get_key("the-key").etag.should.equal(EXPECTED_ETAG)
 
 @mock_s3_deprecated
 @reduced_min_part_size
@@ -346,6 +414,22 @@ def test_copy_key():
 
     bucket.get_key(
         "the-key").get_contents_as_string().should.equal(b"some value")
+    bucket.get_key(
+        "new-key").get_contents_as_string().should.equal(b"some value")
+
+
+@mock_s3_deprecated
+def test_copy_key_with_unicode():
+    conn = boto.connect_s3('the_key', 'the_secret')
+    bucket = conn.create_bucket("foobar")
+    key = Key(bucket)
+    key.key = "the-unicode-💩-key"
+    key.set_contents_from_string("some value")
+
+    bucket.copy_key('new-key', 'foobar', 'the-unicode-💩-key')
+
+    bucket.get_key(
+        "the-unicode-💩-key").get_contents_as_string().should.equal(b"some value")
     bucket.get_key(
         "new-key").get_contents_as_string().should.equal(b"some value")
 
@@ -954,6 +1038,15 @@ def test_bucket_location():
     bucket.get_location().should.equal("us-west-2")
 
 
+@mock_s3
+def test_bucket_location_us_east_1():
+    cli = boto3.client('s3')
+    bucket_name = 'mybucket'
+    # No LocationConstraint ==> us-east-1
+    cli.create_bucket(Bucket=bucket_name)
+    cli.get_bucket_location(Bucket=bucket_name)['LocationConstraint'].should.equal(None)
+
+
 @mock_s3_deprecated
 def test_ranged_get():
     conn = boto.connect_s3()
@@ -1141,6 +1234,30 @@ def test_boto3_list_keys_xml_escaped():
 
 
 @mock_s3
+def test_boto3_list_objects_v2_common_prefix_pagination():
+    s3 = boto3.client('s3', region_name='us-east-1')
+    s3.create_bucket(Bucket='mybucket')
+
+    max_keys = 1
+    keys = ['test/{i}/{i}'.format(i=i) for i in range(3)]
+    for key in keys:
+        s3.put_object(Bucket='mybucket', Key=key, Body=b'v')
+
+    prefixes = []
+    args = {"Bucket": 'mybucket', "Delimiter": "/", "Prefix": "test/", "MaxKeys": max_keys}
+    resp = {"IsTruncated": True}
+    while resp.get("IsTruncated", False):
+        if "NextContinuationToken" in resp:
+            args["ContinuationToken"] = resp["NextContinuationToken"]
+        resp = s3.list_objects_v2(**args)
+        if "CommonPrefixes" in resp:
+            assert len(resp["CommonPrefixes"]) == max_keys
+            prefixes.extend(i["Prefix"] for i in resp["CommonPrefixes"])
+
+    assert prefixes == [k[:k.rindex('/') + 1] for k in keys]
+
+
+@mock_s3
 def test_boto3_list_objects_v2_truncated_response():
     s3 = boto3.client('s3', region_name='us-east-1')
     s3.create_bucket(Bucket='mybucket')
@@ -1278,6 +1395,16 @@ def test_bucket_create_duplicate():
 
 
 @mock_s3
+def test_bucket_create_force_us_east_1():
+    s3 = boto3.resource('s3', region_name='us-east-1')
+    with assert_raises(ClientError) as exc:
+        s3.create_bucket(Bucket="blah", CreateBucketConfiguration={
+            'LocationConstraint': 'us-east-1',
+        })
+    exc.exception.response['Error']['Code'].should.equal('InvalidLocationConstraint')
+
+
+@mock_s3
 def test_boto3_bucket_create_eu_central():
     s3 = boto3.resource('s3', region_name='eu-central-1')
     s3.create_bucket(Bucket="blah")
@@ -1388,6 +1515,34 @@ def test_boto3_copy_object_with_versioning():
 
     # Version should be different to previous version
     obj2_version_new.should_not.equal(obj2_version)
+
+
+@mock_s3
+def test_boto3_deleted_versionings_list():
+    client = boto3.client('s3', region_name='us-east-1')
+
+    client.create_bucket(Bucket='blah')
+    client.put_bucket_versioning(Bucket='blah', VersioningConfiguration={'Status': 'Enabled'})
+
+    client.put_object(Bucket='blah', Key='test1', Body=b'test1')
+    client.put_object(Bucket='blah', Key='test2', Body=b'test2')
+    client.delete_objects(Bucket='blah', Delete={'Objects': [{'Key': 'test1'}]})
+
+    listed = client.list_objects_v2(Bucket='blah')
+    assert len(listed['Contents']) == 1
+
+
+@mock_s3
+def test_boto3_delete_versioned_bucket():
+    client = boto3.client('s3', region_name='us-east-1')
+
+    client.create_bucket(Bucket='blah')
+    client.put_bucket_versioning(Bucket='blah', VersioningConfiguration={'Status': 'Enabled'})
+
+    resp = client.put_object(Bucket='blah', Key='test1', Body=b'test1')
+    client.delete_object(Bucket='blah', Key='test1', VersionId=resp["VersionId"])
+
+    client.delete_bucket(Bucket='blah')
 
 
 @mock_s3
@@ -1502,6 +1657,24 @@ def test_boto3_put_bucket_tagging():
     })
     resp['ResponseMetadata']['HTTPStatusCode'].should.equal(200)
 
+    # With duplicate tag keys:
+    with assert_raises(ClientError) as err:
+        resp = s3.put_bucket_tagging(Bucket=bucket_name,
+                                     Tagging={
+                                         "TagSet": [
+                                             {
+                                                 "Key": "TagOne",
+                                                 "Value": "ValueOne"
+                                             },
+                                             {
+                                                 "Key": "TagOne",
+                                                 "Value": "ValueOneAgain"
+                                             }
+                                         ]
+                                     })
+    e = err.exception
+    e.response["Error"]["Code"].should.equal("InvalidTag")
+    e.response["Error"]["Message"].should.equal("Cannot provide multiple Tags with the same key")
 
 @mock_s3
 def test_boto3_get_bucket_tagging():
@@ -1821,6 +1994,233 @@ def test_put_bucket_acl_body():
 
 
 @mock_s3
+def test_put_bucket_notification():
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="bucket")
+
+    # With no configuration:
+    result = s3.get_bucket_notification(Bucket="bucket")
+    assert not result.get("TopicConfigurations")
+    assert not result.get("QueueConfigurations")
+    assert not result.get("LambdaFunctionConfigurations")
+
+    # Place proper topic configuration:
+    s3.put_bucket_notification_configuration(Bucket="bucket",
+                                             NotificationConfiguration={
+                                                 "TopicConfigurations": [
+                                                     {
+                                                         "TopicArn": "arn:aws:sns:us-east-1:012345678910:mytopic",
+                                                         "Events": [
+                                                             "s3:ObjectCreated:*",
+                                                             "s3:ObjectRemoved:*"
+                                                         ]
+                                                     },
+                                                     {
+                                                         "TopicArn": "arn:aws:sns:us-east-1:012345678910:myothertopic",
+                                                         "Events": [
+                                                             "s3:ObjectCreated:*"
+                                                         ],
+                                                         "Filter": {
+                                                             "Key": {
+                                                                 "FilterRules": [
+                                                                     {
+                                                                         "Name": "prefix",
+                                                                         "Value": "images/"
+                                                                     },
+                                                                     {
+                                                                         "Name": "suffix",
+                                                                         "Value": "png"
+                                                                     }
+                                                                 ]
+                                                             }
+                                                         }
+                                                     }
+                                                 ]
+                                             })
+
+    # Verify to completion:
+    result = s3.get_bucket_notification_configuration(Bucket="bucket")
+    assert len(result["TopicConfigurations"]) == 2
+    assert not result.get("QueueConfigurations")
+    assert not result.get("LambdaFunctionConfigurations")
+    assert result["TopicConfigurations"][0]["TopicArn"] == "arn:aws:sns:us-east-1:012345678910:mytopic"
+    assert result["TopicConfigurations"][1]["TopicArn"] == "arn:aws:sns:us-east-1:012345678910:myothertopic"
+    assert len(result["TopicConfigurations"][0]["Events"]) == 2
+    assert len(result["TopicConfigurations"][1]["Events"]) == 1
+    assert result["TopicConfigurations"][0]["Events"][0] == "s3:ObjectCreated:*"
+    assert result["TopicConfigurations"][0]["Events"][1] == "s3:ObjectRemoved:*"
+    assert result["TopicConfigurations"][1]["Events"][0] == "s3:ObjectCreated:*"
+    assert result["TopicConfigurations"][0]["Id"]
+    assert result["TopicConfigurations"][1]["Id"]
+    assert not result["TopicConfigurations"][0].get("Filter")
+    assert len(result["TopicConfigurations"][1]["Filter"]["Key"]["FilterRules"]) == 2
+    assert result["TopicConfigurations"][1]["Filter"]["Key"]["FilterRules"][0]["Name"] == "prefix"
+    assert result["TopicConfigurations"][1]["Filter"]["Key"]["FilterRules"][0]["Value"] == "images/"
+    assert result["TopicConfigurations"][1]["Filter"]["Key"]["FilterRules"][1]["Name"] == "suffix"
+    assert result["TopicConfigurations"][1]["Filter"]["Key"]["FilterRules"][1]["Value"] == "png"
+
+    # Place proper queue configuration:
+    s3.put_bucket_notification_configuration(Bucket="bucket",
+                                             NotificationConfiguration={
+                                                 "QueueConfigurations": [
+                                                     {
+                                                         "Id": "SomeID",
+                                                         "QueueArn": "arn:aws:sqs:us-east-1:012345678910:myQueue",
+                                                         "Events": ["s3:ObjectCreated:*"],
+                                                         "Filter": {
+                                                             "Key": {
+                                                                 "FilterRules": [
+                                                                     {
+                                                                         "Name": "prefix",
+                                                                         "Value": "images/"
+                                                                     }
+                                                                 ]
+                                                             }
+                                                         }
+                                                     }
+                                                 ]
+                                             })
+    result = s3.get_bucket_notification_configuration(Bucket="bucket")
+    assert len(result["QueueConfigurations"]) == 1
+    assert not result.get("TopicConfigurations")
+    assert not result.get("LambdaFunctionConfigurations")
+    assert result["QueueConfigurations"][0]["Id"] == "SomeID"
+    assert result["QueueConfigurations"][0]["QueueArn"] == "arn:aws:sqs:us-east-1:012345678910:myQueue"
+    assert result["QueueConfigurations"][0]["Events"][0] == "s3:ObjectCreated:*"
+    assert len(result["QueueConfigurations"][0]["Events"]) == 1
+    assert len(result["QueueConfigurations"][0]["Filter"]["Key"]["FilterRules"]) == 1
+    assert result["QueueConfigurations"][0]["Filter"]["Key"]["FilterRules"][0]["Name"] == "prefix"
+    assert result["QueueConfigurations"][0]["Filter"]["Key"]["FilterRules"][0]["Value"] == "images/"
+
+    # Place proper Lambda configuration:
+    s3.put_bucket_notification_configuration(Bucket="bucket",
+                                             NotificationConfiguration={
+                                                 "LambdaFunctionConfigurations": [
+                                                     {
+                                                         "LambdaFunctionArn":
+                                                             "arn:aws:lambda:us-east-1:012345678910:function:lambda",
+                                                         "Events": ["s3:ObjectCreated:*"],
+                                                         "Filter": {
+                                                             "Key": {
+                                                                 "FilterRules": [
+                                                                     {
+                                                                         "Name": "prefix",
+                                                                         "Value": "images/"
+                                                                     }
+                                                                 ]
+                                                             }
+                                                         }
+                                                     }
+                                                 ]
+                                             })
+    result = s3.get_bucket_notification_configuration(Bucket="bucket")
+    assert len(result["LambdaFunctionConfigurations"]) == 1
+    assert not result.get("TopicConfigurations")
+    assert not result.get("QueueConfigurations")
+    assert result["LambdaFunctionConfigurations"][0]["Id"]
+    assert result["LambdaFunctionConfigurations"][0]["LambdaFunctionArn"] == \
+        "arn:aws:lambda:us-east-1:012345678910:function:lambda"
+    assert result["LambdaFunctionConfigurations"][0]["Events"][0] == "s3:ObjectCreated:*"
+    assert len(result["LambdaFunctionConfigurations"][0]["Events"]) == 1
+    assert len(result["LambdaFunctionConfigurations"][0]["Filter"]["Key"]["FilterRules"]) == 1
+    assert result["LambdaFunctionConfigurations"][0]["Filter"]["Key"]["FilterRules"][0]["Name"] == "prefix"
+    assert result["LambdaFunctionConfigurations"][0]["Filter"]["Key"]["FilterRules"][0]["Value"] == "images/"
+
+    # And with all 3 set:
+    s3.put_bucket_notification_configuration(Bucket="bucket",
+                                             NotificationConfiguration={
+                                                 "TopicConfigurations": [
+                                                     {
+                                                         "TopicArn": "arn:aws:sns:us-east-1:012345678910:mytopic",
+                                                         "Events": [
+                                                             "s3:ObjectCreated:*",
+                                                             "s3:ObjectRemoved:*"
+                                                         ]
+                                                     }
+                                                 ],
+                                                 "LambdaFunctionConfigurations": [
+                                                     {
+                                                         "LambdaFunctionArn":
+                                                             "arn:aws:lambda:us-east-1:012345678910:function:lambda",
+                                                         "Events": ["s3:ObjectCreated:*"]
+                                                     }
+                                                 ],
+                                                 "QueueConfigurations": [
+                                                     {
+                                                         "QueueArn": "arn:aws:sqs:us-east-1:012345678910:myQueue",
+                                                         "Events": ["s3:ObjectCreated:*"]
+                                                     }
+                                                 ]
+                                             })
+    result = s3.get_bucket_notification_configuration(Bucket="bucket")
+    assert len(result["LambdaFunctionConfigurations"]) == 1
+    assert len(result["TopicConfigurations"]) == 1
+    assert len(result["QueueConfigurations"]) == 1
+
+    # And clear it out:
+    s3.put_bucket_notification_configuration(Bucket="bucket", NotificationConfiguration={})
+    result = s3.get_bucket_notification_configuration(Bucket="bucket")
+    assert not result.get("TopicConfigurations")
+    assert not result.get("QueueConfigurations")
+    assert not result.get("LambdaFunctionConfigurations")
+
+
+@mock_s3
+def test_put_bucket_notification_errors():
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="bucket")
+
+    # With incorrect ARNs:
+    for tech, arn in [("Queue", "sqs"), ("Topic", "sns"), ("LambdaFunction", "lambda")]:
+        with assert_raises(ClientError) as err:
+            s3.put_bucket_notification_configuration(Bucket="bucket",
+                                                     NotificationConfiguration={
+                                                         "{}Configurations".format(tech): [
+                                                             {
+                                                                 "{}Arn".format(tech):
+                                                                     "arn:aws:{}:us-east-1:012345678910:lksajdfkldskfj",
+                                                                 "Events": ["s3:ObjectCreated:*"]
+                                                             }
+                                                         ]
+                                                     })
+
+        assert err.exception.response["Error"]["Code"] == "InvalidArgument"
+        assert err.exception.response["Error"]["Message"] == "The ARN is not well formed"
+
+    # Region not the same as the bucket:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_notification_configuration(Bucket="bucket",
+                                                 NotificationConfiguration={
+                                                     "QueueConfigurations": [
+                                                         {
+                                                             "QueueArn":
+                                                                 "arn:aws:sqs:us-west-2:012345678910:lksajdfkldskfj",
+                                                             "Events": ["s3:ObjectCreated:*"]
+                                                         }
+                                                     ]
+                                                 })
+
+    assert err.exception.response["Error"]["Code"] == "InvalidArgument"
+    assert err.exception.response["Error"]["Message"] == \
+        "The notification destination service region is not valid for the bucket location constraint"
+
+    # Invalid event name:
+    with assert_raises(ClientError) as err:
+        s3.put_bucket_notification_configuration(Bucket="bucket",
+                                                 NotificationConfiguration={
+                                                     "QueueConfigurations": [
+                                                         {
+                                                             "QueueArn":
+                                                                 "arn:aws:sqs:us-east-1:012345678910:lksajdfkldskfj",
+                                                             "Events": ["notarealeventname"]
+                                                         }
+                                                     ]
+                                                 })
+    assert err.exception.response["Error"]["Code"] == "InvalidArgument"
+    assert err.exception.response["Error"]["Message"] == "The event is not supported for notifications"
+
+
+@mock_s3
 def test_boto3_put_bucket_logging():
     s3 = boto3.client("s3", region_name="us-east-1")
     bucket_name = "mybucket"
@@ -1938,7 +2338,7 @@ def test_boto3_put_bucket_logging():
     result = s3.get_bucket_logging(Bucket=bucket_name)
     assert len(result["LoggingEnabled"]["TargetGrants"]) == 2
     assert result["LoggingEnabled"]["TargetGrants"][0]["Grantee"]["ID"] == \
-        "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274"
+           "SOMEIDSTRINGHERE9238748923734823917498237489237409123840983274"
 
     # Test with just 1 grant:
     s3.put_bucket_logging(Bucket=bucket_name, BucketLoggingStatus={
@@ -2108,6 +2508,35 @@ def test_boto3_list_object_versions():
 
 
 @mock_s3
+def test_boto3_bad_prefix_list_object_versions():
+    s3 = boto3.client('s3', region_name='us-east-1')
+    bucket_name = 'mybucket'
+    key = 'key-with-versions'
+    bad_prefix = 'key-that-does-not-exist'
+    s3.create_bucket(Bucket=bucket_name)
+    s3.put_bucket_versioning(
+        Bucket=bucket_name,
+        VersioningConfiguration={
+            'Status': 'Enabled'
+        }
+    )
+    items = (six.b('v1'), six.b('v2'))
+    for body in items:
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=key,
+            Body=body
+        )
+    response = s3.list_object_versions(
+        Bucket=bucket_name,
+        Prefix=bad_prefix,
+    )
+    response['ResponseMetadata']['HTTPStatusCode'].should.equal(200)
+    response.should_not.contain('Versions')
+    response.should_not.contain('DeleteMarkers')
+
+
+@mock_s3
 def test_boto3_delete_markers():
     s3 = boto3.client('s3', region_name='us-east-1')
     bucket_name = 'mybucket'
@@ -2165,6 +2594,72 @@ def test_boto3_delete_markers():
 
 
 @mock_s3
+def test_boto3_multiple_delete_markers():
+    s3 = boto3.client('s3', region_name='us-east-1')
+    bucket_name = 'mybucket'
+    key = u'key-with-versions-and-unicode-ó'
+    s3.create_bucket(Bucket=bucket_name)
+    s3.put_bucket_versioning(
+        Bucket=bucket_name,
+        VersioningConfiguration={
+            'Status': 'Enabled'
+        }
+    )
+    items = (six.b('v1'), six.b('v2'))
+    for body in items:
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=key,
+            Body=body
+        )
+
+    # Delete the object twice to add multiple delete markers
+    s3.delete_object(Bucket=bucket_name, Key=key)
+    s3.delete_object(Bucket=bucket_name, Key=key)
+
+    response = s3.list_object_versions(Bucket=bucket_name)
+    response['DeleteMarkers'].should.have.length_of(2)
+
+    with assert_raises(ClientError) as e:
+        s3.get_object(
+            Bucket=bucket_name,
+            Key=key
+        )
+        e.response['Error']['Code'].should.equal('404')
+
+    # Remove both delete markers to restore the object
+    s3.delete_object(
+        Bucket=bucket_name,
+        Key=key,
+        VersionId='2'
+    )
+    s3.delete_object(
+        Bucket=bucket_name,
+        Key=key,
+        VersionId='3'
+    )
+
+    response = s3.get_object(
+        Bucket=bucket_name,
+        Key=key
+    )
+    response['Body'].read().should.equal(items[-1])
+    response = s3.list_object_versions(Bucket=bucket_name)
+    response['Versions'].should.have.length_of(2)
+
+    # We've asserted there is only 2 records so one is newest, one is oldest
+    latest = list(filter(lambda item: item['IsLatest'], response['Versions']))[0]
+    oldest = list(filter(lambda item: not item['IsLatest'], response['Versions']))[0]
+
+    # Double check ordering of version ID's
+    latest['VersionId'].should.equal('1')
+    oldest['VersionId'].should.equal('0')
+
+    # Double check the name is still unicode
+    latest['Key'].should.equal('key-with-versions-and-unicode-ó')
+    oldest['Key'].should.equal('key-with-versions-and-unicode-ó')
+
+@mock_s3
 def test_get_stream_gzipped():
     payload = b"this is some stuff here"
 
@@ -2208,3 +2703,17 @@ TEST_XML = """\
     </ns0:RoutingRules>
 </ns0:WebsiteConfiguration>
 """
+
+@mock_s3
+def test_boto3_bucket_name_too_long():
+    s3 = boto3.client('s3', region_name='us-east-1')
+    with assert_raises(ClientError) as exc:
+        s3.create_bucket(Bucket='x'*64)
+    exc.exception.response['Error']['Code'].should.equal('InvalidBucketName')
+
+@mock_s3
+def test_boto3_bucket_name_too_short():
+    s3 = boto3.client('s3', region_name='us-east-1')
+    with assert_raises(ClientError) as exc:
+        s3.create_bucket(Bucket='x'*2)
+    exc.exception.response['Error']['Code'].should.equal('InvalidBucketName')

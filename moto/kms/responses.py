@@ -38,6 +38,28 @@ class KmsResponse(BaseResponse):
             policy, key_usage, description, self.region)
         return json.dumps(key.to_dict())
 
+    def update_key_description(self):
+        key_id = self.parameters.get('KeyId')
+        description = self.parameters.get('Description')
+
+        self.kms_backend.update_key_description(key_id, description)
+        return json.dumps(None)
+
+    def tag_resource(self):
+        key_id = self.parameters.get('KeyId')
+        tags = self.parameters.get('Tags')
+        self.kms_backend.tag_resource(key_id, tags)
+        return json.dumps({})
+
+    def list_resource_tags(self):
+        key_id = self.parameters.get('KeyId')
+        tags = self.kms_backend.list_resource_tags(key_id)
+        return json.dumps({
+            "Tags": tags,
+            "NextMarker": None,
+            "Truncated": False,
+        })
+
     def describe_key(self):
         key_id = self.parameters.get('KeyId')
         try:
@@ -232,6 +254,56 @@ class KmsResponse(BaseResponse):
     def decrypt(self):
         value = self.parameters.get("CiphertextBlob")
         return json.dumps({"Plaintext": base64.b64decode(value).decode("utf-8")})
+
+    def disable_key(self):
+        key_id = self.parameters.get('KeyId')
+        _assert_valid_key_id(self.kms_backend.get_key_id(key_id))
+        try:
+            self.kms_backend.disable_key(key_id)
+        except KeyError:
+            raise JSONResponseError(404, 'Not Found', body={
+                'message': "Key 'arn:aws:kms:{region}:012345678912:key/{key_id}' does not exist".format(region=self.region, key_id=key_id),
+                '__type': 'NotFoundException'})
+        return json.dumps(None)
+
+    def enable_key(self):
+        key_id = self.parameters.get('KeyId')
+        _assert_valid_key_id(self.kms_backend.get_key_id(key_id))
+        try:
+            self.kms_backend.enable_key(key_id)
+        except KeyError:
+            raise JSONResponseError(404, 'Not Found', body={
+                'message': "Key 'arn:aws:kms:{region}:012345678912:key/{key_id}' does not exist".format(region=self.region, key_id=key_id),
+                '__type': 'NotFoundException'})
+        return json.dumps(None)
+
+    def cancel_key_deletion(self):
+        key_id = self.parameters.get('KeyId')
+        _assert_valid_key_id(self.kms_backend.get_key_id(key_id))
+        try:
+            self.kms_backend.cancel_key_deletion(key_id)
+        except KeyError:
+            raise JSONResponseError(404, 'Not Found', body={
+                'message': "Key 'arn:aws:kms:{region}:012345678912:key/{key_id}' does not exist".format(region=self.region, key_id=key_id),
+                '__type': 'NotFoundException'})
+        return json.dumps({'KeyId': key_id})
+
+    def schedule_key_deletion(self):
+        key_id = self.parameters.get('KeyId')
+        if self.parameters.get('PendingWindowInDays') is None:
+            pending_window_in_days = 30
+        else:
+            pending_window_in_days = self.parameters.get('PendingWindowInDays')
+        _assert_valid_key_id(self.kms_backend.get_key_id(key_id))
+        try:
+            return json.dumps({
+                'KeyId': key_id,
+                'DeletionDate': self.kms_backend.schedule_key_deletion(key_id, pending_window_in_days)
+            })
+        except KeyError:
+            raise JSONResponseError(404, 'Not Found', body={
+                'message': "Key 'arn:aws:kms:{region}:012345678912:key/{key_id}' does not exist".format(region=self.region, key_id=key_id),
+                '__type': 'NotFoundException'})
 
 
 def _assert_valid_key_id(key_id):

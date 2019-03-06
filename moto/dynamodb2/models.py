@@ -5,6 +5,7 @@ import datetime
 import decimal
 import json
 import re
+import uuid
 
 import boto3
 from moto.compat import OrderedDict
@@ -65,6 +66,8 @@ class DynamoType(object):
                 return int(self.value)
             except ValueError:
                 return float(self.value)
+        elif self.is_set():
+            return set(self.value)
         else:
             return self.value
 
@@ -135,7 +138,9 @@ class Item(BaseModel):
         assert len(parts) % 2 == 0, "Mismatched operators and values in update expression: '{}'".format(update_expression)
         for action, valstr in zip(parts[:-1:2], parts[1::2]):
             action = action.upper()
-            values = valstr.split(',')
+
+            # "Should" retain arguments in side (...)
+            values = re.split(r',(?![^(]*\))', valstr)
             for value in values:
                 # A Real value
                 value = value.lstrip(":").rstrip(",").strip()
@@ -145,13 +150,28 @@ class Item(BaseModel):
                 if action == "REMOVE":
                     self.attrs.pop(value, None)
                 elif action == 'SET':
-                    key, value = value.split("=")
+                    key, value = value.split("=", 1)
                     key = key.strip()
                     value = value.strip()
-                    if value in expression_attribute_values:
-                        value = DynamoType(expression_attribute_values[value])
-                    else:
-                        value = DynamoType({"S": value})
+
+                    # If not exists, changes value to a default if needed, else its the same as it was
+                    if value.startswith('if_not_exists'):
+                        # Function signature
+                        match = re.match(r'.*if_not_exists\s*\((?P<path>.+),\s*(?P<default>.+)\).*', value)
+                        if not match:
+                            raise TypeError
+
+                        path, value = match.groups()
+
+                        # If it already exists, get its value so we dont overwrite it
+                        if path in self.attrs:
+                            value = self.attrs[path]
+
+                    if type(value) != DynamoType:
+                        if value in expression_attribute_values:
+                            value = DynamoType(expression_attribute_values[value])
+                        else:
+                            value = DynamoType({"S": value})
 
                     if '.' not in key:
                         self.attrs[key] = value
@@ -160,16 +180,17 @@ class Item(BaseModel):
                         key_parts = key.split('.')
                         attr = key_parts.pop(0)
                         if attr not in self.attrs:
-                            raise ValueError()
+                            raise ValueError
 
                         last_val = self.attrs[attr].value
                         for key_part in key_parts:
                             # Hack but it'll do, traverses into a dict
-                            if list(last_val.keys())[0] == 'M':
-                                last_val = last_val['M']
+                            last_val_type = list(last_val.keys())
+                            if last_val_type and last_val_type[0] == 'M':
+                                    last_val = last_val['M']
 
                             if key_part not in last_val:
-                                raise ValueError()
+                                last_val[key_part] = {'M': {}}
 
                             last_val = last_val[key_part]
 
@@ -247,9 +268,9 @@ class Item(BaseModel):
                     self.attrs[attribute_name] = DynamoType({"SS": new_value})
                 elif isinstance(new_value, dict):
                     self.attrs[attribute_name] = DynamoType({"M": new_value})
-                elif update_action['Value'].keys() == ['N']:
+                elif set(update_action['Value'].keys()) == set(['N']):
                     self.attrs[attribute_name] = DynamoType({"N": new_value})
-                elif update_action['Value'].keys() == ['NULL']:
+                elif set(update_action['Value'].keys()) == set(['NULL']):
                     if attribute_name in self.attrs:
                         del self.attrs[attribute_name]
                 else:
@@ -274,9 +295,82 @@ class Item(BaseModel):
                         'ADD not supported for %s' % ', '.join(update_action['Value'].keys()))
 
 
+class StreamRecord(BaseModel):
+    def __init__(self, table, stream_type, event_name, old, new, seq):
+        old_a = old.to_json()['Attributes'] if old is not None else {}
+        new_a = new.to_json()['Attributes'] if new is not None else {}
+
+        rec = old if old is not None else new
+        keys = {table.hash_key_attr: rec.hash_key.to_json()}
+        if table.range_key_attr is not None:
+            keys[table.range_key_attr] = rec.range_key.to_json()
+
+        self.record = {
+            'eventID': uuid.uuid4().hex,
+            'eventName': event_name,
+            'eventSource': 'aws:dynamodb',
+            'eventVersion': '1.0',
+            'awsRegion': 'us-east-1',
+            'dynamodb': {
+                'StreamViewType': stream_type,
+                'ApproximateCreationDateTime': datetime.datetime.utcnow().isoformat(),
+                'SequenceNumber': seq,
+                'SizeBytes': 1,
+                'Keys': keys
+            }
+        }
+
+        if stream_type in ('NEW_IMAGE', 'NEW_AND_OLD_IMAGES'):
+            self.record['dynamodb']['NewImage'] = new_a
+        if stream_type in ('OLD_IMAGE', 'NEW_AND_OLD_IMAGES'):
+            self.record['dynamodb']['OldImage'] = old_a
+
+        # This is a substantial overestimate but it's the easiest to do now
+        self.record['dynamodb']['SizeBytes'] = len(
+            json.dumps(self.record['dynamodb']))
+
+    def to_json(self):
+        return self.record
+
+
+class StreamShard(BaseModel):
+    def __init__(self, table):
+        self.table = table
+        self.id = 'shardId-00000001541626099285-f35f62ef'
+        self.starting_sequence_number = 1100000000017454423009
+        self.items = []
+        self.created_on = datetime.datetime.utcnow()
+
+    def to_json(self):
+        return {
+            'ShardId': self.id,
+            'SequenceNumberRange': {
+                'StartingSequenceNumber': str(self.starting_sequence_number)
+            }
+        }
+
+    def add(self, old, new):
+        t = self.table.stream_specification['StreamViewType']
+        if old is None:
+            event_name = 'INSERT'
+        elif new is None:
+            event_name = 'DELETE'
+        else:
+            event_name = 'MODIFY'
+        seq = len(self.items) + self.starting_sequence_number
+        self.items.append(
+            StreamRecord(self.table, t, event_name, old, new, seq))
+
+    def get(self, start, quantity):
+        start -= self.starting_sequence_number
+        assert start >= 0
+        end = start + quantity
+        return [i.to_json() for i in self.items[start:end]]
+
+
 class Table(BaseModel):
 
-    def __init__(self, table_name, schema=None, attr=None, throughput=None, indexes=None, global_indexes=None):
+    def __init__(self, table_name, schema=None, attr=None, throughput=None, indexes=None, global_indexes=None, streams=None):
         self.name = table_name
         self.attr = attr
         self.schema = schema
@@ -307,9 +401,21 @@ class Table(BaseModel):
             'TimeToLiveStatus': 'DISABLED'  # One of 'ENABLING'|'DISABLING'|'ENABLED'|'DISABLED',
             # 'AttributeName': 'string'  # Can contain this
         }
+        self.set_stream_specification(streams)
 
     def _generate_arn(self, name):
         return 'arn:aws:dynamodb:us-east-1:123456789011:table/' + name
+
+    def set_stream_specification(self, streams):
+        self.stream_specification = streams
+        if streams and (streams.get('StreamEnabled') or streams.get('StreamViewType')):
+            self.stream_specification['StreamEnabled'] = True
+            self.latest_stream_label = datetime.datetime.utcnow().isoformat()
+            self.stream_shard = StreamShard(self)
+        else:
+            self.stream_specification = {'StreamEnabled': False}
+            self.latest_stream_label = None
+            self.stream_shard = None
 
     def describe(self, base_key='TableDescription'):
         results = {
@@ -327,6 +433,11 @@ class Table(BaseModel):
                 'LocalSecondaryIndexes': [index for index in self.indexes],
             }
         }
+        if self.stream_specification and self.stream_specification['StreamEnabled']:
+            results[base_key]['StreamSpecification'] = self.stream_specification
+            if self.latest_stream_label:
+                results[base_key]['LatestStreamLabel'] = self.latest_stream_label
+                results[base_key]['LatestStreamArn'] = self.table_arn + '/stream/' + self.latest_stream_label
         return results
 
     def __len__(self):
@@ -367,23 +478,22 @@ class Table(BaseModel):
         else:
             range_value = None
 
+        if expected is None:
+            expected = {}
+            lookup_range_value = range_value
+        else:
+            expected_range_value = expected.get(
+                self.range_key_attr, {}).get("Value")
+            if(expected_range_value is None):
+                lookup_range_value = range_value
+            else:
+                lookup_range_value = DynamoType(expected_range_value)
+        current = self.get_item(hash_value, lookup_range_value)
+
         item = Item(hash_value, self.hash_key_type, range_value,
                     self.range_key_type, item_attrs)
 
         if not overwrite:
-            if expected is None:
-                expected = {}
-                lookup_range_value = range_value
-            else:
-                expected_range_value = expected.get(
-                    self.range_key_attr, {}).get("Value")
-                if(expected_range_value is None):
-                    lookup_range_value = range_value
-                else:
-                    lookup_range_value = DynamoType(expected_range_value)
-
-            current = self.get_item(hash_value, lookup_range_value)
-
             if current is None:
                 current_attr = {}
             elif hasattr(current, 'attrs'):
@@ -392,7 +502,8 @@ class Table(BaseModel):
                 current_attr = current
 
             for key, val in expected.items():
-                if 'Exists' in val and val['Exists'] is False:
+                if 'Exists' in val and val['Exists'] is False \
+                        or 'ComparisonOperator' in val and val['ComparisonOperator'] == 'NULL':
                     if key in current_attr:
                         raise ValueError("The conditional request failed")
                 elif key not in current_attr:
@@ -400,17 +511,20 @@ class Table(BaseModel):
                 elif 'Value' in val and DynamoType(val['Value']).value != current_attr[key].value:
                     raise ValueError("The conditional request failed")
                 elif 'ComparisonOperator' in val:
-                    comparison_func = get_comparison_func(
-                        val['ComparisonOperator'])
-                    dynamo_types = [DynamoType(ele) for ele in val[
-                        "AttributeValueList"]]
-                    for t in dynamo_types:
-                        if not comparison_func(current_attr[key].value, t.value):
-                            raise ValueError('The conditional request failed')
+                    dynamo_types = [
+                        DynamoType(ele) for ele in
+                        val.get("AttributeValueList", [])
+                    ]
+                    if not current_attr[key].compare(val['ComparisonOperator'], dynamo_types):
+                        raise ValueError('The conditional request failed')
         if range_value:
             self.items[hash_value][range_value] = item
         else:
             self.items[hash_value] = item
+
+        if self.stream_shard is not None:
+            self.stream_shard.add(current, item)
+
         return item
 
     def __nonzero__(self):
@@ -441,9 +555,14 @@ class Table(BaseModel):
     def delete_item(self, hash_key, range_key):
         try:
             if range_key:
-                return self.items[hash_key].pop(range_key)
+                item = self.items[hash_key].pop(range_key)
             else:
-                return self.items.pop(hash_key)
+                item = self.items.pop(hash_key)
+
+            if self.stream_shard is not None:
+                self.stream_shard.add(item, None)
+
+            return item
         except KeyError:
             return None
 
@@ -520,14 +639,6 @@ class Table(BaseModel):
         else:
             results.sort(key=lambda item: item.range_key)
 
-        if projection_expression:
-            expressions = [x.strip() for x in projection_expression.split(',')]
-            results = copy.deepcopy(results)
-            for result in results:
-                for attr in list(result.attrs):
-                    if attr not in expressions:
-                        result.attrs.pop(attr)
-
         if scan_index_forward is False:
             results.reverse()
 
@@ -535,6 +646,14 @@ class Table(BaseModel):
 
         if filter_expression is not None:
             results = [item for item in results if filter_expression.expr(item)]
+
+        if projection_expression:
+            expressions = [x.strip() for x in projection_expression.split(',')]
+            results = copy.deepcopy(results)
+            for result in results:
+                for attr in list(result.attrs):
+                    if attr not in expressions:
+                        result.attrs.pop(attr)
 
         results, last_evaluated_key = self._trim_results(results, limit,
                                                          exclusive_start_key)
@@ -659,6 +778,13 @@ class DynamoDBBackend(BaseBackend):
         table.throughput = throughput
         return table
 
+    def update_table_streams(self, name, stream_specification):
+        table = self.tables[name]
+        if (stream_specification.get('StreamEnabled') or stream_specification.get('StreamViewType')) and table.latest_stream_label:
+            raise ValueError('Table already has stream enabled')
+        table.set_stream_specification(stream_specification)
+        return table
+
     def update_table_global_indexes(self, name, global_index_updates):
         table = self.tables[name]
         gsis_by_name = dict((i['IndexName'], i) for i in table.global_indexes)
@@ -689,7 +815,9 @@ class DynamoDBBackend(BaseBackend):
 
                 gsis_by_name[gsi_to_create['IndexName']] = gsi_to_create
 
-        table.global_indexes = gsis_by_name.values()
+        # in python 3.6, dict.values() returns a dict_values object, but we expect it to be a list in other
+        # parts of the codebase
+        table.global_indexes = list(gsis_by_name.values())
         return table
 
     def put_item(self, table_name, item_attrs, expected=None, overwrite=False):
@@ -808,7 +936,8 @@ class DynamoDBBackend(BaseBackend):
             expected = {}
 
         for key, val in expected.items():
-            if 'Exists' in val and val['Exists'] is False:
+            if 'Exists' in val and val['Exists'] is False \
+                    or 'ComparisonOperator' in val and val['ComparisonOperator'] == 'NULL':
                 if key in item_attr:
                     raise ValueError("The conditional request failed")
             elif key not in item_attr:
@@ -816,13 +945,12 @@ class DynamoDBBackend(BaseBackend):
             elif 'Value' in val and DynamoType(val['Value']).value != item_attr[key].value:
                 raise ValueError("The conditional request failed")
             elif 'ComparisonOperator' in val:
-                comparison_func = get_comparison_func(
-                    val['ComparisonOperator'])
-                dynamo_types = [DynamoType(ele) for ele in val[
-                    "AttributeValueList"]]
-                for t in dynamo_types:
-                    if not comparison_func(item_attr[key].value, t.value):
-                        raise ValueError('The conditional request failed')
+                dynamo_types = [
+                    DynamoType(ele) for ele in
+                    val.get("AttributeValueList", [])
+                ]
+                if not item_attr[key].compare(val['ComparisonOperator'], dynamo_types):
+                    raise ValueError('The conditional request failed')
 
         # Update does not fail on new items, so create one
         if item is None:
